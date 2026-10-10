@@ -13,3 +13,5 @@ app.py                   the Streamlit frontend (graph built from data/associati
 ```
 
 ! for now i havent added the neo4j db, this will be the next step, graph is directly build using the assocaitions.json file
+
+<img width="3842" height="2711" alt="pipeline" src="https://github.com/user-attachments/assets/837989fc-de31-4e4d-b2c8-4bd27dda95af" />
