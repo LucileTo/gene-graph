@@ -1,0 +1,10 @@
+biopython
+requests
+python-dotenv
+pydantic
+openai
+tqdm
+rapidfuzz
+pandas
+streamlit
+pyvis

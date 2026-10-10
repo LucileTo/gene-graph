@@ -1,0 +1,16 @@
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Secrets (never commit!)
+.env
+
+# Generated data
+data/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
