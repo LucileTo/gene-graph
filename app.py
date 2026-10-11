@@ -1,17 +1,22 @@
-"""Streamlit app to explore the ALS knowledge graph built from data/association.json
+"""Streamlit app to explore the ALS knowledge graph stored in Neo4j (filled by src/associations_llm.py)
 
     streamlit run app.py
 """
 
 import json
 import math
+import os
+from collections import Counter
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+from dotenv import load_dotenv
+from neo4j import GraphDatabase
 from pyvis.network import Network
 
-ASSOCIATION_FILE = Path(__file__).resolve().parent / "data" / "association.json"
+ROOT = Path(__file__).resolve().parent
+load_dotenv(ROOT / ".env")
 ALS_ID = "MESH:D000690"
 COLORS = {"Gene": "#2a78d6", "Drug": "#eb6834", "Disease": "#1baf7a"}
 RELATION_TYPES = ["TARGETS", "INTERACTS_WITH", "ASSOCIATED_WITH", "TESTED_FOR"]
@@ -20,15 +25,63 @@ MAX_EDGES = 200  # keep the whole-network view readable
 st.set_page_config(page_title="ALS Knowledge Graph", page_icon="🧬", layout="wide")
 
 
-@st.cache_data
-def load_data(path: Path, modified: float):  # `modified`: reload when the file changes
-    data = json.loads(path.read_text(encoding="utf-8"))
-    relations = pd.DataFrame(data["associations"], columns=[
-        "subject_id", "subject", "subject_type", "relation", "object_id", "object", "object_type",
-        "negated", "n_articles", "certainty", "outcome", "pmids", "evidences", "outcomes", "years"])
-    relations = relations[~relations["negated"].astype(bool)].copy()
+COLUMNS = ["subject_id", "subject", "subject_type", "relation", "object_id", "object", "object_type",
+           "negated", "n_articles", "certainty", "outcome", "pmids", "evidences", "outcomes", "years"]
+
+
+def summarize_outcome(outcomes: list) -> str | None:
+    """Most frequent outcome ('inconclusive' on a tie)."""
+    ranked = Counter(o for o in outcomes if o).most_common()
+    if not ranked:
+        return None
+    if len(ranked) > 1 and ranked[0][1] == ranked[1][1]:
+        return "inconclusive"
+    return ranked[0][0]
+
+
+def read_neo4j() -> tuple[list[dict], dict]:
+    """One edge per (subject, relation, object), aggregated from the per-article relationships."""
+    with GraphDatabase.driver(os.getenv("NEO4J_URI", "bolt://localhost:7687"),
+                              auth=(os.getenv("NEO4J_USER", "neo4j"), os.getenv("NEO4J_PASSWORD", ""))) as driver:
+        def query(cypher):
+            return [r.data() for r in driver.execute_query(cypher)[0]]
+
+        edges = query("""
+            MATCH (s:Entity)-[r]->(o:Entity) WHERE r.negated = false
+            MATCH (a:Article {pmid: r.pmid})
+            RETURN s.id AS subject_id, s.name AS subject, s.type AS subject_type, type(r) AS relation,
+                   o.id AS object_id, o.name AS object, o.type AS object_type,
+                   collect(r.pmid) AS pmids, collect(r.evidence) AS evidences,
+                   collect(coalesce(r.outcome, '')) AS outcomes, collect(coalesce(a.year, 0)) AS years,
+                   collect(r.certainty) AS certainties""")
+        stats = {
+            "articles_by_llm_status": {r["k"]: r["n"] for r in query(
+                "MATCH (a:Article) RETURN a.status AS k, count(*) AS n")},
+            "entities": {r["k"]: r["n"] for r in query("MATCH (e:Entity) RETURN e.type AS k, count(*) AS n")},
+            "article_relations": {r["k"]: r["n"] for r in query(
+                "MATCH (:Entity)-[r]->(:Entity) RETURN type(r) AS k, count(*) AS n")},
+            "negated_article_relations": query(
+                "MATCH (:Entity)-[r]->(:Entity) WHERE r.negated = true RETURN count(r) AS n")[0]["n"],
+            "rejected_by_reason": dict(Counter(
+                x["reason"] for r in query("MATCH (a:Article) WHERE a.rejected IS NOT NULL RETURN a.rejected AS j")
+                for x in json.loads(r["j"]))),
+        }
+    for edge in edges:
+        edge["outcomes"] = [o or None for o in edge["outcomes"]]
+        edge["years"] = [y or None for y in edge["years"]]  # 0 = unknown year (lists cannot hold null)
+        edge["n_articles"] = len(edge["pmids"])
+        edge["certainty"] = "established" if "established" in edge.pop("certainties") else "suggested"
+        edge["outcome"] = summarize_outcome(edge["outcomes"])
+        edge["negated"] = False
+    return edges, stats
+
+
+@st.cache_data(ttl=300)  # reload from Neo4j every 5 minutes
+def load_data():
+    edges, stats = read_neo4j()
+    relations = pd.DataFrame(edges, columns=COLUMNS)
     relations["with_als"] = relations["object_id"] == ALS_ID
-    return relations, data["stats"]
+    return relations, stats
 
 
 def als_profile(als_relations: pd.DataFrame) -> dict:
@@ -97,14 +150,14 @@ def show_evidence(table: pd.DataFrame, key: str) -> None:
 st.sidebar.title("🧬 ALS Knowledge Graph")
 page = st.sidebar.radio("Page", ["Explorer", "Statistics"])
 
-if not ASSOCIATION_FILE.exists():
-    st.warning("No data yet. Run the 3 scripts of `src/` in order "
-               "(`python src/pubmed_extraction.py --limit 20`, then keyword_builder, then associations_llm).")
+try:
+    relations, stats = load_data()
+except Exception as error:  # Neo4j down or wrong password
+    st.error(f"Cannot read Neo4j ({type(error).__name__}). Start it with `docker compose up -d` "
+             "and check NEO4J_* in `.env`.")
     st.stop()
-relations, stats = load_data(ASSOCIATION_FILE, ASSOCIATION_FILE.stat().st_mtime)
 if relations.empty:
-    st.info("No relations yet: the LLM extraction has not been run. Add your LLM key "
-            "in `.env` and run `python src/associations_llm.py`.")
+    st.info("No relations in Neo4j yet. Run the pipeline (the last step is `src/associations_llm.py`).")
     st.stop()
 
 st.sidebar.header("Filters")
