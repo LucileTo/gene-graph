@@ -1,0 +1,15 @@
+# Local Neo4j:  docker compose up -d     (browser: http://localhost:7474)
+# NEO4J_PASSWORD is read from .env (at least 8 characters)
+services:
+  neo4j:
+    image: neo4j:5-community
+    ports:
+      - "7474:7474"   # browser
+      - "7687:7687"   # bolt (used by the scripts and the app)
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:?set NEO4J_PASSWORD in .env}
+    volumes:
+      - neo4j_data:/data
+
+volumes:
+  neo4j_data:

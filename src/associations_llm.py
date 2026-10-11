@@ -1,8 +1,10 @@
-"""Step 3: extract the relations between the entities of each abstract with an LLM -> data/association.json
+"""Step 3: extract the relations between the entities of each abstract with an LLM -> Neo4j
 
     python src/associations_llm.py [--limit 20] [--force]
 
-association.json = {"stats", "associations" (graph edges), "articles" (LLM result per PMID, to resume runs)}
+(:Entity {id, name, type})-[:ASSOCIATED_WITH | TARGETS | TESTED_FOR | INTERACTS_WITH {pmid, evidence, ...}]->(:Entity)
+One relationship per (article, relation). Each article's LLM status (extracted / skipped / error) is stored on
+an (:Article {pmid, year, status, error, rejected}) node: this is what lets a stopped run resume.
 """
 
 import argparse
@@ -18,6 +20,7 @@ from pathlib import Path
 
 import openai
 from dotenv import load_dotenv
+from neo4j import GraphDatabase
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from rapidfuzz import fuzz
 from tqdm import tqdm
@@ -25,7 +28,6 @@ from tqdm import tqdm
 ROOT = Path(__file__).resolve().parent.parent
 ABSTRACT_FILE = ROOT / "data" / "abstract.json"
 KEYWORDS_FILE = ROOT / "data" / "keywords.json"
-ASSOCIATION_FILE = ROOT / "data" / "association.json"
 load_dotenv(ROOT / ".env")
 
 TEMPERATURE = 0
@@ -276,89 +278,45 @@ def process_article(client: LLMClient, record: dict) -> dict:
     return {"status": "extracted", "accepted": accepted, "rejected": rejected}
 
 
-# ------------------------------------------------------------------ merge into graph edges
+# ------------------------------------------------------------------ Neo4j storage
 
-def summarize_outcome(outcomes: list) -> str | None:
-    """Most frequent outcome ('inconclusive' on a tie)."""
-    ranked = Counter(o for o in outcomes if o).most_common()
-    if not ranked:
-        return None
-    if len(ranked) > 1 and ranked[0][1] == ranked[1][1]:
-        return "inconclusive"
-    return ranked[0][0]
+def connect():
+    driver = GraphDatabase.driver(os.getenv("NEO4J_URI", "bolt://localhost:7687"),
+                                  auth=(os.getenv("NEO4J_USER", "neo4j"), os.getenv("NEO4J_PASSWORD", "")))
+    driver.verify_connectivity()
+    driver.execute_query("CREATE CONSTRAINT entity_id IF NOT EXISTS FOR (e:Entity) REQUIRE e.id IS UNIQUE")
+    driver.execute_query("CREATE CONSTRAINT article_pmid IF NOT EXISTS FOR (a:Article) REQUIRE a.pmid IS UNIQUE")
+    return driver
 
 
-def merge_triplets(triplets: list[dict], names: dict, years: dict) -> list[dict]:
-    """One graph edge per (subject, relation, object, negated)."""
-    groups = {}
-    for t in triplets:
+def save_result(driver, article: dict, record: dict, result: dict) -> None:
+    """Replace everything stored for this article: its status and its relationships."""
+    driver.execute_query("MATCH (:Entity)-[r]->(:Entity) WHERE r.pmid = $pmid DELETE r", pmid=article["pmid"])
+    driver.execute_query(
+        "MERGE (a:Article {pmid: $pmid}) SET a.year = $year, a.status = $status, a.error = $error, "
+        "a.rejected = $rejected", pmid=article["pmid"], year=article["year"], status=result["status"],
+        error=result.get("error"), rejected=json.dumps(result["rejected"]))
+
+    entities = {e["id"]: e for e in record["entities"]}
+    by_relation = {}
+    for t in result["accepted"]:
         subject, obj = t["subject"]["id"], t["object"]["id"]
         if t["relation"] == "INTERACTS_WITH" and subject > obj:
             subject, obj = obj, subject  # A-B and B-A are the same interaction
-        group = groups.setdefault((subject, t["relation"], obj, t["negated"]), {
-            "subject_id": subject, "subject_type": t["subject_type"],
-            "relation": t["relation"],
-            "object_id": obj, "object_type": t["object_type"],
-            "negated": t["negated"], "pmids": [], "evidences": [], "outcomes": [],
-            "certainties": [], "models": set(), "prompt_versions": set(), "extracted_at": "",
-        })
-        if t["pmid"] in group["pmids"]:
-            continue  # same relation twice in the same abstract
-        group["pmids"].append(t["pmid"])
-        group["evidences"].append(t["evidence"])
-        group["outcomes"].append(t["outcome"])
-        group["certainties"].append(t["certainty"])
-        group["models"].add(t["model"])
-        group["prompt_versions"].add(t["prompt_version"])
-        group["extracted_at"] = max(group["extracted_at"], t["extracted_at"])
-
-    return [{
-        "subject_id": g["subject_id"], "subject": names.get(g["subject_id"], g["subject_id"]),
-        "subject_type": g["subject_type"],
-        "relation": g["relation"],
-        "object_id": g["object_id"], "object": names.get(g["object_id"], g["object_id"]),
-        "object_type": g["object_type"],
-        "negated": g["negated"],
-        "n_articles": len(g["pmids"]),
-        "certainty": "established" if "established" in g["certainties"] else "suggested",
-        "outcome": summarize_outcome(g["outcomes"]),
-        "model": ";".join(sorted(g["models"])),
-        "prompt_version": ";".join(sorted(g["prompt_versions"])),
-        "extracted_at": g["extracted_at"],
-        "pmids": g["pmids"],
-        "evidences": g["evidences"],
-        "outcomes": g["outcomes"],
-        "years": [years.get(p) for p in g["pmids"]],
-    } for g in groups.values()]
-
-
-def save(articles: list[dict], keywords: dict, results: dict) -> dict:
-    pmids = [a["pmid"] for a in articles]
-    records = [keywords[p] for p in pmids if p in keywords]
-    done = [results[p] for p in pmids if p in results]
-
-    names, entity_types = {}, {}
-    for record in records:
-        for e in record["entities"]:
-            names.setdefault(e["id"], e["name"])
-            entity_types.setdefault(e["id"], e["type"])
-
-    triplets = [t for r in done for t in r["accepted"]]
-    associations = merge_triplets(triplets, names, {a["pmid"]: a["year"] for a in articles})
-    kept = [a for a in associations if not a["negated"]]
-    stats = {
-        "articles": len(articles),
-        "articles_annotated_by_pubtator": len(records),
-        "articles_sent_to_llm": sum(r["status"] == "extracted" for r in done),
-        "entities": dict(Counter(entity_types.values())),
-        "relations_by_type": dict(Counter(a["relation"] for a in kept)),
-        "negated_relations": len(associations) - len(kept),
-        "rejected_by_reason": dict(Counter(x["reason"] for r in done for x in r["rejected"])),
-        "llm_errors": sum(r["status"] == "error" for r in done),
-    }
-    output = {"stats": stats, "associations": associations, "articles": results}
-    ASSOCIATION_FILE.write_text(json.dumps(output, ensure_ascii=False, indent=1), encoding="utf-8")
-    return stats
+        props = {k: t[k] for k in ("pmid", "evidence", "certainty", "negated", "outcome",
+                                   "evidence_score", "model", "prompt_version", "extracted_at")}
+        # the same relation twice in one abstract is stored once (the first one)
+        by_relation.setdefault(t["relation"], {}).setdefault((subject, obj, t["negated"]), {
+            "subject": {"id": subject, "name": entities[subject]["name"], "type": entities[subject]["type"]},
+            "object": {"id": obj, "name": entities[obj]["name"], "type": entities[obj]["type"]},
+            "props": props})
+    for relation, rows in by_relation.items():
+        assert relation in RELATION_SIGNATURES  # relation names cannot be Cypher parameters
+        driver.execute_query(
+            "UNWIND $rows AS row "
+            "MERGE (s:Entity {id: row.subject.id}) ON CREATE SET s.name = row.subject.name, s.type = row.subject.type "
+            "MERGE (o:Entity {id: row.object.id}) ON CREATE SET o.name = row.object.name, o.type = row.object.type "
+            f"CREATE (s)-[r:{relation}]->(o) SET r = row.props", rows=list(rows.values()))
 
 
 def run(limit: int | None = None, force: bool = False) -> None:
@@ -366,13 +324,15 @@ def run(limit: int | None = None, force: bool = False) -> None:
         raise SystemExit("No entities found: run src/keyword_builder.py first.")
     articles = json.loads(ABSTRACT_FILE.read_text("utf-8"))[:limit]
     keywords = json.loads(KEYWORDS_FILE.read_text("utf-8"))
-    results = {}
-    if ASSOCIATION_FILE.exists() and not force:
-        results = json.loads(ASSOCIATION_FILE.read_text("utf-8"))["articles"]
+    driver = connect()
+    if force:
+        driver.execute_query("MATCH (n) DETACH DELETE n")
+    done, _, _ = driver.execute_query(
+        "MATCH (a:Article) WHERE a.status IN ['extracted', 'skipped'] RETURN a.pmid AS pmid")
+    done = {r["pmid"] for r in done}
 
     # Articles that failed last time (status "error") are retried
-    todo = [a["pmid"] for a in articles if a["pmid"] in keywords
-            and results.get(a["pmid"], {}).get("status") not in ("extracted", "skipped")]
+    todo = [a for a in articles if a["pmid"] in keywords and a["pmid"] not in done]
     logger.info("%d articles to process (prompt version %s).", len(todo), PROMPT_VERSION)
     if todo and not os.getenv("LLM_API_KEY", "").strip():
         logger.warning("LLM_API_KEY is empty in .env: extraction skipped. Get a free key at "
@@ -380,22 +340,21 @@ def run(limit: int | None = None, force: bool = False) -> None:
         todo = []
     client = LLMClient() if todo else None
 
-    for pmid in tqdm(todo, desc="LLM", unit="article"):
-        record = keywords[pmid]
+    for article in tqdm(todo, desc="LLM", unit="article"):
+        record = keywords[article["pmid"]]
         if not has_candidate_pair(record["entities"]):
-            results[pmid] = {"status": "skipped", "accepted": [], "rejected": []}
+            result = {"status": "skipped", "accepted": [], "rejected": []}
         else:
             try:
-                results[pmid] = process_article(client, record)
+                result = process_article(client, record)
             except QuotaExhaustedError as error:
                 logger.error("Stopping: %s Processed articles are saved, rerun later.", error)
                 break
             except ValidationError as error:
-                results[pmid] = {"status": "error", "error": str(error), "accepted": [], "rejected": []}
-        save(articles, keywords, results)  # a stopped run loses nothing
-
-    stats = save(articles, keywords, results)
-    logger.info("Associations written to %s\n%s", ASSOCIATION_FILE, json.dumps(stats, indent=2))
+                result = {"status": "error", "error": str(error), "accepted": [], "rejected": []}
+        save_result(driver, article, record, result)  # a stopped run loses nothing
+    driver.close()
+    logger.info("Relations written to Neo4j.")
 
 
 if __name__ == "__main__":
