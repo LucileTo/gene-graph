@@ -1,5 +1,7 @@
 # ALS Knowledge Graph app
 
+In short: step 1 gets the **articles**, step 2 finds the **entities** (genes, diseases, drugs) in them, and step 3 uses an LLM to find the **relations** between those entities. See [docs/pipeline-steps.md](docs/pipeline-steps.md) for a side-by-side comparison of the three steps and [docs/](docs/README.md) for the rest of the documentation.
+
 hello Daffa & Heru!!!, here a little summary of the project 
 
 ```
