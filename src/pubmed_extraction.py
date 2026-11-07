@@ -1,7 +1,3 @@
-"""Step 1: download ALS abstracts from PubMed -> data/abstract.json
-
-    python src/pubmed_extraction.py [--limit 20] [--force]
-"""
 
 import argparse
 import html
@@ -23,6 +19,10 @@ load_dotenv(ROOT / ".env")
 # PubMed search
 QUERY = ('"Amyotrophic Lateral Sclerosis"[MeSH] AND (gene* OR genetic* OR therap* OR drug* '
          'OR treatment*) AND hasabstract')
+
+QUERY_NON_ALS = ('(C9orf72 OR SOD1 OR TARDBP OR FUS) AND (drug* OR inhibitor* OR therap*) '
+                   'AND hasabstract NOT "Amyotrophic Lateral Sclerosis"[MeSH]')
+
 MIN_DATE, MAX_DATE = "2020", "2026"
 MAX_ARTICLES = 500
 SORT = "relevance"  # or "pub_date" (very recent articles are often not yet in PubTator3)
@@ -69,12 +69,12 @@ def clean_text(text) -> str:
     return html.unescape(re.sub(r"</?(i|b|u|sub|sup)>", "", str(text))).strip()
 
 
-def run(limit: int | None = None, force: bool = False) -> None:
+def run(limit: int | None = None, force: bool = False, non_als=False) -> None:
     configure_entrez()
     articles = [] if force or not ABSTRACT_FILE.exists() else json.loads(ABSTRACT_FILE.read_text("utf-8"))
 
     # 1. esearch: list of PMIDs matching the query
-    handle = Entrez.esearch(db="pubmed", term=QUERY, mindate=MIN_DATE, maxdate=MAX_DATE,
+    handle = Entrez.esearch(db="pubmed", term=QUERY_NON_ALS if non_als else QUERY, mindate=MIN_DATE, maxdate=MAX_DATE,
                             datetype="pdat", retmax=limit or MAX_ARTICLES, sort=SORT)
     result = Entrez.read(handle)
     logger.info("%s articles match the query, keeping %d.", result["Count"], len(result["IdList"]))
@@ -98,7 +98,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--limit", type=int, help=f"Max number of articles (default: {MAX_ARTICLES})")
     parser.add_argument("--force", action="store_true", help="Download all articles again")
+    parser.add_argument("--non-als", action="store_true")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-7s | %(message)s",
                         datefmt="%H:%M:%S")
-    run(limit=args.limit, force=args.force)
+    run(limit=args.limit, force=args.force, non_als=args.non_als)

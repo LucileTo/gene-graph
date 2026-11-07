@@ -1,7 +1,3 @@
-"""Step 2: find the genes, diseases and drugs of each abstract with PubTator3 -> data/keywords.json
-
-    python src/keyword_builder.py [--limit 20] [--force]
-"""
 
 import argparse
 import json
@@ -33,6 +29,28 @@ def make_id(raw_id: str, pubtator_type: str, text: str) -> str:
         return f"NCBIGene:{raw_id}"
     return raw_id  # already prefixed, e.g. MESH:D000690
 
+ALS_ID = "MESH:D000690"
+ALS_RE = re.compile(r"\bALS\b|[Aa]myotrophic [Ll]ateral [Ss]clerosis")
+
+def new_als():
+    return {"id": ALS_ID, "type": "Disease", "name": "Amyotrophic Lateral Sclerosis",
+            "normalized": True, "mentions": []}
+
+def fix_als(entities: dict, text: str) -> None:
+    """PubTator sometimes tags 'ALS' as another disease, or misses it."""
+    for eid in list(entities):
+        ent = entities[eid]
+        if eid == ALS_ID or ent["type"] != "Disease":
+            continue
+        wrong = [m for m in ent["mentions"] if m["text"] == "ALS"]
+        if wrong:
+            entities.setdefault(ALS_ID, new_als())["mentions"] += wrong
+            ent["mentions"] = [m for m in ent["mentions"] if m not in wrong]
+            if not ent["mentions"]:
+                del entities[eid]
+    if ALS_ID not in entities and ALS_RE.search(text):
+        entities[ALS_ID] = new_als()
+
 
 def parse_document(doc: dict) -> dict:
     texts = {"title": "", "abstract": ""}
@@ -60,6 +78,7 @@ def parse_document(doc: dict) -> dict:
                     entity["mentions"].append(
                         {"text": annotation["text"], "offset": loc["offset"], "length": loc["length"]})
 
+    fix_als(entities, texts["title"] + " " + texts["abstract"])
     merge_unnormalized(entities)
 
     # Kept for a later comparison with the LLM

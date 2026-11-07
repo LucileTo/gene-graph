@@ -1,9 +1,4 @@
-"""Step 3: extract the relations between the entities of each abstract with an LLM -> data/association.json
 
-    python src/associations_llm.py [--limit 20] [--force]
-
-association.json = {"stats", "associations" (graph edges), "articles" (LLM result per PMID, to resume runs)}
-"""
 
 import argparse
 import json

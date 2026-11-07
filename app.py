@@ -3,32 +3,79 @@
     streamlit run app.py
 """
 
-import json
+import os
 import math
 from pathlib import Path
+from dotenv import load_dotenv
+from neo4j import GraphDatabase
 
 import pandas as pd
 import streamlit as st
 from pyvis.network import Network
 
-ASSOCIATION_FILE = Path(__file__).resolve().parent / "data" / "association.json"
+# Load konfigurasi Neo4j dari .env
+load_dotenv()
+NEO4J_URI = os.getenv("NEO4J_URI")
+NEO4J_USER = os.getenv("NEO4J_USER")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
+
 ALS_ID = "MESH:D000690"
 COLORS = {"Gene": "#2a78d6", "Drug": "#eb6834", "Disease": "#1baf7a"}
 RELATION_TYPES = ["TARGETS", "INTERACTS_WITH", "ASSOCIATED_WITH", "TESTED_FOR"]
-MAX_EDGES = 200  # keep the whole-network view readable
+MAX_EDGES = 200  
 
 st.set_page_config(page_title="ALS Knowledge Graph", page_icon="🧬", layout="wide")
 
+# Inisialisasi Driver Neo4j dengan cache_resource agar koneksi efisien
+@st.cache_resource
+def get_neo4j_driver():
+    return GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+
+driver = get_neo4j_driver()
 
 @st.cache_data
-def load_data(path: Path, modified: float):  # `modified`: reload when the file changes
-    data = json.loads(path.read_text(encoding="utf-8"))
-    relations = pd.DataFrame(data["associations"], columns=[
-        "subject_id", "subject", "subject_type", "relation", "object_id", "object", "object_type",
-        "negated", "n_articles", "certainty", "outcome", "pmids", "evidences", "outcomes", "years"])
+def load_data():
+    query = """
+    MATCH (s:Entity)-[r]->(o:Entity)
+    RETURN 
+        s.id AS subject_id, 
+        s.name AS subject, 
+        s.type AS subject_type,
+        type(r) AS relation,
+        o.id AS object_id, 
+        o.name AS object, 
+        o.type AS object_type,
+        coalesce(r.negated, false) AS negated,
+        coalesce(r.n_articles, 1) AS n_articles,
+        coalesce(r.certainty, 'established') AS certainty,
+        r.outcome AS outcome,
+        r.pmids AS pmids,
+        r.evidences AS evidences,
+        r.outcomes AS outcomes,
+        r.years AS years
+    """
+    
+    with driver.session() as session:
+        result = session.run(query)
+        relations = pd.DataFrame([record.data() for record in result])
+    
+    if relations.empty:
+        relations = pd.DataFrame(columns=[
+            "subject_id", "subject", "subject_type", "relation", "object_id", "object", "object_type",
+            "negated", "n_articles", "certainty", "outcome", "pmids", "evidences", "outcomes", "years"
+        ])
+        
     relations = relations[~relations["negated"].astype(bool)].copy()
     relations["with_als"] = relations["object_id"] == ALS_ID
-    return relations, data["stats"]
+
+    # Tambahkan ini untuk melihat isi data mentah dari Neo4j di halaman Streamlit
+    st.write("Total baris data dari Neo4j:", len(relations))
+    if not relations.empty:
+        st.write("Contoh data mentah:", relations.head(2))
+    
+    stats = {"database": "Neo4j Local", "total_relations": len(relations)}
+    return relations, stats
+
 
 
 def als_profile(als_relations: pd.DataFrame) -> dict:
@@ -97,11 +144,18 @@ def show_evidence(table: pd.DataFrame, key: str) -> None:
 st.sidebar.title("🧬 ALS Knowledge Graph")
 page = st.sidebar.radio("Page", ["Explorer", "Statistics"])
 
-if not ASSOCIATION_FILE.exists():
-    st.warning("No data yet. Run the 3 scripts of `src/` in order "
-               "(`python src/pubmed_extraction.py --limit 20`, then keyword_builder, then associations_llm).")
-    st.stop()
-relations, stats = load_data(ASSOCIATION_FILE, ASSOCIATION_FILE.stat().st_mtime)
+# if not ASSOCIATION_FILE.exists():
+#     st.warning("No data yet. Run the 3 scripts of `src/` in order "
+#                "(`python src/pubmed_extraction.py --limit 20`, then keyword_builder, then associations_llm).")
+#     st.stop()
+# relations, stats = load_data(ASSOCIATION_FILE, ASSOCIATION_FILE.stat().st_mtime)
+
+relations, stats = load_data()
+
+# if relations.empty:
+#     st.info("Belum ada data di database Neo4j. Jalankan script inserter data terlebih dahulu.")
+#     st.stop()
+
 if relations.empty:
     st.info("No relations yet: the LLM extraction has not been run. Add your LLM key "
             "in `.env` and run `python src/associations_llm.py`.")
@@ -115,12 +169,34 @@ min_articles = st.sidebar.slider("Minimum number of articles", 1,
                                  max(int(relations["n_articles"].max()), 2), 1)
 years = st.sidebar.slider("Publication years", 2015, 2026, (2020, 2026))
 
+def check_year(ys, year_range):
+    if ys is None:
+        return False
+    # Kalau tersimpan sebagai string tunggal atau angka
+    if isinstance(ys, (int, float, str)):
+        try:
+            y_int = int(ys)
+            return year_range[0] <= y_int <= year_range[1]
+        except ValueError:
+            return False
+    # Kalau tersimpan sebagai list / array dari Neo4j
+    if isinstance(ys, (list, tuple, set)):
+        for y in ys:
+            if y is not None:
+                try:
+                    if year_range[0] <= int(y) <= year_range[1]:
+                        return True
+                except (ValueError, TypeError):
+                    continue
+    return False
+
 filtered = relations[
     relations["relation"].isin(types)
     & relations["certainty"].isin(certainties)
     & (relations["n_articles"] >= min_articles)
-    & relations["years"].apply(lambda ys: any(y and years[0] <= y <= years[1] for y in ys))
+    & relations["years"].apply(lambda ys: check_year(ys, years))
 ]
+
 # ALS is not drawn (the whole corpus is about ALS): links with ALS become node size and tooltip
 als_relations = filtered[filtered["with_als"]]
 network = filtered[~filtered["with_als"]]
