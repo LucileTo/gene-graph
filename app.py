@@ -1,95 +1,58 @@
-"""Streamlit app to explore the ALS knowledge graph built from data/association.json
+"""Streamlit app to explore the mechanism-centered knowledge graph stored in Neo4j.
 
     streamlit run app.py
 """
 
-import os
 import math
+import os
 from pathlib import Path
-from dotenv import load_dotenv
-from neo4j import GraphDatabase
 
 import pandas as pd
 import streamlit as st
+from dotenv import load_dotenv
+from neo4j import GraphDatabase
 from pyvis.network import Network
 
-# Load konfigurasi Neo4j dari .env
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parent / ".env")
 NEO4J_URI = os.getenv("NEO4J_URI")
 NEO4J_USER = os.getenv("NEO4J_USER")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
 
-ALS_ID = "MESH:D000690"
-COLORS = {"Gene": "#2a78d6", "Drug": "#eb6834", "Disease": "#1baf7a"}
-RELATION_TYPES = ["TARGETS", "INTERACTS_WITH", "ASSOCIATED_WITH", "TESTED_FOR"]
-MAX_EDGES = 200  
+COLORS = {"Mechanism": "#7b4fd6", "Disease": "#1baf7a", "Molecule": "#eb6834"}
+RELATION_TYPES = ["involved_in", "inhibits", "activates", "induces", "agonist_of",
+                  "tested", "treatment", "documented_in_literature"]
+MAX_EDGES = 200
 
-st.set_page_config(page_title="ALS Knowledge Graph", page_icon="🧬", layout="wide")
+st.set_page_config(page_title="Mechanism Knowledge Graph", page_icon="🧬", layout="wide")
 
-# Inisialisasi Driver Neo4j dengan cache_resource agar koneksi efisien
+
 @st.cache_resource
-def get_neo4j_driver():
+def get_driver():
     return GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
 
-driver = get_neo4j_driver()
 
 @st.cache_data
-def load_data():
+def load_data() -> pd.DataFrame:
     query = """
     MATCH (s:Entity)-[r]->(o:Entity)
-    RETURN 
-        s.id AS subject_id, 
-        s.name AS subject, 
-        s.type AS subject_type,
-        type(r) AS relation,
-        o.id AS object_id, 
-        o.name AS object, 
-        o.type AS object_type,
-        coalesce(r.negated, false) AS negated,
-        coalesce(r.n_articles, 1) AS n_articles,
-        coalesce(r.certainty, 'established') AS certainty,
-        r.outcome AS outcome,
-        r.pmids AS pmids,
-        r.evidences AS evidences,
-        r.outcomes AS outcomes,
-        r.years AS years
+    RETURN s.id AS subject_id, s.name AS subject, s.type AS subject_type,
+           type(r) AS relation,
+           o.id AS object_id, o.name AS object, o.type AS object_type,
+           coalesce(r.source, 'llm') AS source,
+           coalesce(r.n_articles, 0) AS n_articles,
+           coalesce(r.certainty, 'established') AS certainty,
+           r.outcome AS outcome, r.pmids AS pmids, r.evidences AS evidences,
+           r.outcomes AS outcomes, r.years AS years
     """
-    
-    with driver.session() as session:
-        result = session.run(query)
-        relations = pd.DataFrame([record.data() for record in result])
-    
-    if relations.empty:
-        relations = pd.DataFrame(columns=[
-            "subject_id", "subject", "subject_type", "relation", "object_id", "object", "object_type",
-            "negated", "n_articles", "certainty", "outcome", "pmids", "evidences", "outcomes", "years"
-        ])
-        
-    relations = relations[~relations["negated"].astype(bool)].copy()
-    relations["with_als"] = relations["object_id"] == ALS_ID
-
-    # Tambahkan ini untuk melihat isi data mentah dari Neo4j di halaman Streamlit
-    st.write("Total baris data dari Neo4j:", len(relations))
-    if not relations.empty:
-        st.write("Contoh data mentah:", relations.head(2))
-    
-    stats = {"database": "Neo4j Local", "total_relations": len(relations)}
-    return relations, stats
-
-
-
-def als_profile(als_relations: pd.DataFrame) -> dict:
-    return {r["subject_id"]: {"relation": r["relation"], "n_articles": r["n_articles"],
-                              "outcome": r["outcome"] if isinstance(r["outcome"], str) else None}
-            for _, r in als_relations.iterrows()}
-
-
-def describe_als(profile: dict | None) -> str:
-    if not profile:
-        return "no direct link with ALS in the corpus"
-    if profile["relation"] == "TESTED_FOR":
-        return f"tested in ALS ({profile['n_articles']} articles, outcome: {profile['outcome']})"
-    return f"associated with ALS ({profile['n_articles']} articles)"
+    with get_driver().session() as session:
+        rows = [record.data() for record in session.run(query)]
+    columns = ["subject_id", "subject", "subject_type", "relation", "object_id", "object",
+               "object_type", "source", "n_articles", "certainty", "outcome", "pmids",
+               "evidences", "outcomes", "years"]
+    data = pd.DataFrame(rows, columns=columns)
+    for column in ("pmids", "evidences", "outcomes", "years"):
+        data[column] = data[column].apply(lambda v: v if isinstance(v, list) else [])
+    return data
 
 
 def neighborhood(edges: pd.DataFrame, center: str, depth: int) -> pd.DataFrame:
@@ -100,65 +63,58 @@ def neighborhood(edges: pd.DataFrame, center: str, depth: int) -> pd.DataFrame:
     return edges[edges["subject_id"].isin(reached) & edges["object_id"].isin(reached)]
 
 
-def draw_graph(edges: pd.DataFrame, profiles: dict, center: str | None) -> str:
+def draw_graph(edges: pd.DataFrame, center: str | None) -> str:
     net = Network(height="620px", width="100%", directed=True, bgcolor="#ffffff",
                   font_color="#0b0b0b", cdn_resources="in_line")
     net.set_options("""{
       "nodes": {"scaling": {"label": {"drawThreshold": 1}}},
       "edges": {"arrows": {"to": {"enabled": true, "scaleFactor": 0.5}}, "smooth": false},
       "physics": {"barnesHut": {"gravitationalConstant": -2500, "centralGravity": 0.6,
-                                "springLength": 90, "avoidOverlap": 0.5},
+                                "springLength": 110, "avoidOverlap": 0.5},
                   "stabilization": {"iterations": 300}},
       "interaction": {"hover": true}
     }""")
+    degree = pd.concat([edges["subject_id"], edges["object_id"]]).value_counts()
     for _, r in edges.iterrows():
         for node_id, name, label in ((r["subject_id"], r["subject"], r["subject_type"]),
                                      (r["object_id"], r["object"], r["object_type"])):
-            profile = profiles.get(node_id)
-            n_als = profile["n_articles"] if profile else 0
-            tested = bool(profile) and profile["relation"] == "TESTED_FOR"
-            net.add_node(node_id, label=name, color={"background": COLORS[label], "border": "#0b0b0b" if tested else COLORS[label]},
-                         borderWidth=4 if tested else 1, size=min(10 + 4 * math.sqrt(n_als), 32),
-                         title=f"{name} ({label}): {describe_als(profile)}",
-                         font={"size": 26 if node_id == center else 20})
+            mechanism = label == "Mechanism"
+            net.add_node(node_id, label=name, color=COLORS.get(label, "#a3a29c"),
+                         shape="box" if mechanism else "dot",
+                         size=min(8 + 3 * math.sqrt(degree.get(node_id, 1)), 32),
+                         title=f"{name} ({label}) — {degree.get(node_id, 0)} relations in view",
+                         font={"size": 26 if node_id == center or mechanism else 18})
+        manual = r["source"] == "manual"
         net.add_edge(r["subject_id"], r["object_id"],
-                     title=f"{r['relation']} | {r['n_articles']} article(s) | {r['certainty']}",
-                     width=1 + 2 * math.sqrt(r["n_articles"]), color="#a3a29c",
-                     dashes=r["certainty"] == "suggested")
+                     title=f"{r['relation']} | " + ("manual" if manual else
+                                                    f"{r['n_articles']} article(s) | {r['certainty']}"),
+                     width=2 if manual else 1 + 2 * math.sqrt(r["n_articles"]),
+                     color="#7b4fd6" if manual else "#a3a29c",
+                     dashes=manual or r["certainty"] == "suggested")
     return net.generate_html()
 
 
 def show_evidence(table: pd.DataFrame, key: str) -> None:
-    columns = ["subject", "relation", "object", "n_articles", "certainty", "outcome"]
+    columns = ["subject", "relation", "object", "source", "n_articles", "certainty", "outcome"]
     selection = st.dataframe(table[columns], hide_index=True, width="stretch", key=key,
                              on_select="rerun", selection_mode="single-row")
     if selection.selection.rows:
         row = table.iloc[selection.selection.rows[0]]
         st.markdown(f"#### {row['subject']} → **{row['relation']}** → {row['object']}")
+        if row["source"] == "manual":
+            st.info("Edge added by hand (ALS is excluded from the PubMed query).")
         for pmid, evidence, year, outcome in zip(row["pmids"], row["evidences"], row["years"], row["outcomes"]):
             extra = f" — outcome: **{outcome}**" if outcome else ""
             st.markdown(f"- [PMID {pmid}](https://pubmed.ncbi.nlm.nih.gov/{pmid}/) ({year}){extra}\n\n  > {evidence}")
 
 
 # ------------------------------------------------------------------ sidebar
-st.sidebar.title("🧬 ALS Knowledge Graph")
+st.sidebar.title("🧬 Mechanism Knowledge Graph")
 page = st.sidebar.radio("Page", ["Explorer", "Statistics"])
 
-# if not ASSOCIATION_FILE.exists():
-#     st.warning("No data yet. Run the 3 scripts of `src/` in order "
-#                "(`python src/pubmed_extraction.py --limit 20`, then keyword_builder, then associations_llm).")
-#     st.stop()
-# relations, stats = load_data(ASSOCIATION_FILE, ASSOCIATION_FILE.stat().st_mtime)
-
-relations, stats = load_data()
-
-# if relations.empty:
-#     st.info("Belum ada data di database Neo4j. Jalankan script inserter data terlebih dahulu.")
-#     st.stop()
-
+relations = load_data()
 if relations.empty:
-    st.info("No relations yet: the LLM extraction has not been run. Add your LLM key "
-            "in `.env` and run `python src/associations_llm.py`.")
+    st.info("Neo4j is empty. Run the pipeline, then `python neo4j/query_connection.py`.")
     st.stop()
 
 st.sidebar.header("Filters")
@@ -169,40 +125,14 @@ min_articles = st.sidebar.slider("Minimum number of articles", 1,
                                  max(int(relations["n_articles"].max()), 2), 1)
 years = st.sidebar.slider("Publication years", 2015, 2026, (2020, 2026))
 
-def check_year(ys, year_range):
-    if ys is None:
-        return False
-    # Kalau tersimpan sebagai string tunggal atau angka
-    if isinstance(ys, (int, float, str)):
-        try:
-            y_int = int(ys)
-            return year_range[0] <= y_int <= year_range[1]
-        except ValueError:
-            return False
-    # Kalau tersimpan sebagai list / array dari Neo4j
-    if isinstance(ys, (list, tuple, set)):
-        for y in ys:
-            if y is not None:
-                try:
-                    if year_range[0] <= int(y) <= year_range[1]:
-                        return True
-                except (ValueError, TypeError):
-                    continue
-    return False
-
+manual = relations["source"] == "manual"  # ALS edges: no article, never filtered out
+in_years = relations["years"].apply(lambda ys: any(years[0] <= int(y) <= years[1] for y in ys if y))
 filtered = relations[
     relations["relation"].isin(types)
-    & relations["certainty"].isin(certainties)
-    & (relations["n_articles"] >= min_articles)
-    & relations["years"].apply(lambda ys: check_year(ys, years))
+    & (manual | (relations["certainty"].isin(certainties)
+                 & (relations["n_articles"] >= min_articles) & in_years))
 ]
 
-# ALS is not drawn (the whole corpus is about ALS): links with ALS become node size and tooltip
-als_relations = filtered[filtered["with_als"]]
-network = filtered[~filtered["with_als"]]
-profiles = als_profile(als_relations)
-
-# Every entity of the graph: id -> "name (type)"
 label_of = {}
 for side in ("subject", "object"):
     label_of.update(zip(relations[f"{side}_id"], relations[side] + " (" + relations[f"{side}_type"] + ")"))
@@ -210,68 +140,62 @@ for side in ("subject", "object"):
 # ------------------------------------------------------------------ Explorer
 if page == "Explorer":
     st.title("Explorer")
-    st.caption("ALS is not drawn (the whole corpus is about ALS): an entity's link with ALS is "
-               "shown by its size and in its tooltip.")
+    st.caption("Mechanisms are boxes. ALS was added by hand at the end (purple dashed edges).")
 
-    in_network = sorted(set(network["subject_id"]) | set(network["object_id"]),
+    in_network = sorted(set(filtered["subject_id"]) | set(filtered["object_id"]),
                         key=lambda i: label_of[i].lower())
     left, right = st.columns([3, 1])
-    center = left.selectbox("Search an entity (gene, drug, disease)", [None] + in_network,
+    center = left.selectbox("Search a mechanism, disease or molecule", [None] + in_network,
                             format_func=lambda i: "— whole network —" if i is None else label_of[i])
     depth = right.radio("Neighbors", [1, 2], horizontal=True, disabled=center is None,
-                        help="2 = also the neighbors of the neighbors (e.g. drug → target → ALS gene)")
+                        help="2 = also the neighbors of the neighbors (e.g. molecule → mechanism → ALS)")
 
-    view = neighborhood(network, center, depth) if center else network.nlargest(MAX_EDGES, "n_articles")
+    if center:
+        view = neighborhood(filtered, center, depth)
+    else:
+        view = pd.concat([filtered[filtered["source"] == "manual"],
+                          filtered[filtered["source"] != "manual"].nlargest(MAX_EDGES, "n_articles")])
     if view.empty:
         st.warning("No relation to draw with the current filters.")
     else:
         legend = " &nbsp; ".join(f"<span style='color:{c}'>●</span> {label}" for label, c in COLORS.items())
-        st.markdown(f"{legend} &nbsp;|&nbsp; size = number of ALS articles &nbsp;|&nbsp; "
-                    "dark border = drug tested in ALS &nbsp;|&nbsp; dashed = suggested",
-                    unsafe_allow_html=True)
-        st.iframe(draw_graph(view, profiles, center), height=640)
+        st.markdown(f"{legend} &nbsp;|&nbsp; edge width = number of articles &nbsp;|&nbsp; "
+                    "dashed = suggested or manual", unsafe_allow_html=True)
+        st.iframe(draw_graph(view, center), height=640)
 
-    if center:
-        st.markdown(f"**{label_of[center]}**: {describe_als(profiles.get(center))}")
-    shown = set(view["subject_id"]) | set(view["object_id"]) | ({center} if center else set())
-    table = pd.concat([view, als_relations[als_relations["subject_id"].isin(shown)]])
-    st.subheader(f"{len(table)} relations — select a row to see the evidence")
-    show_evidence(table.sort_values("n_articles", ascending=False), key="explorer_table")
+    st.subheader(f"{len(view)} relations — select a row to see the evidence")
+    show_evidence(view.sort_values("n_articles", ascending=False), key="explorer_table")
 
 # ------------------------------------------------------------------ Statistics
 else:
     st.title("Statistics")
-    entity_types = pd.Series({**dict(zip(relations["subject_id"], relations["subject_type"])),
-                              **dict(zip(relations["object_id"], relations["object_type"]))})
-    counts = entity_types.value_counts()
+    node_types = pd.Series({**dict(zip(relations["subject_id"], relations["subject_type"])),
+                            **dict(zip(relations["object_id"], relations["object_type"]))})
+    counts = node_types.value_counts()
     columns = st.columns(4)
-    for column, label in zip(columns, ["Gene", "Drug", "Disease"]):
+    for column, label in zip(columns, ["Mechanism", "Disease", "Molecule"]):
         column.metric(f"{label} nodes", int(counts.get(label, 0)))
     columns[3].metric("Relations (filtered)", len(filtered))
 
     left, right = st.columns(2)
     left.subheader("Relations by type")
     left.bar_chart(filtered["relation"].value_counts().reset_index(), x="relation", y="count",
-                   horizontal=True, color=COLORS["Gene"], sort="-count")
-    right.subheader("Outcome of ALS trials")
-    trials = als_relations[als_relations["relation"] == "TESTED_FOR"]
-    right.bar_chart(trials["outcome"].fillna("unknown").value_counts().reset_index(), x="outcome",
-                    y="count", horizontal=True, color=COLORS["Drug"], sort="-count")
+                   horizontal=True, color=COLORS["Mechanism"], sort="-count")
+    right.subheader("Diseases per mechanism (involved_in)")
+    involved = filtered[filtered["relation"] == "involved_in"]
+    right.bar_chart(involved["subject"].value_counts().reset_index(), x="subject", y="count",
+                    horizontal=True, color=COLORS["Disease"], sort="-count")
 
-    left, right = st.columns(2)
-    left.subheader("Top 20 genes associated with ALS")
-    genes = als_relations[als_relations["relation"] == "ASSOCIATED_WITH"].nlargest(20, "n_articles")
-    left.bar_chart(genes, x="subject", y="n_articles", horizontal=True, color=COLORS["Gene"],
-                   sort="-n_articles")
-    right.subheader("Drugs tested in ALS")
-    right.dataframe(trials.nlargest(20, "n_articles")[["subject", "n_articles", "outcome"]]
-                    .rename(columns={"subject": "drug", "n_articles": "articles"}),
-                    hide_index=True, width="stretch")
+    st.subheader("Molecules and the mechanisms they act on")
+    acting = filtered[filtered["object_type"] == "Mechanism"]
+    if not acting.empty:
+        table = acting.assign(effect=acting["relation"] + " (" + acting["n_articles"].astype(str) + ")")
+        st.dataframe(table.pivot_table(index="subject", columns="object", values="effect",
+                                       aggfunc=lambda v: ", ".join(v)).fillna(""),
+                     width="stretch")
 
-    st.subheader("Drugs and their targets")
-    st.dataframe(filtered[filtered["relation"] == "TARGETS"][["subject", "object", "n_articles", "certainty"]]
-                 .rename(columns={"subject": "drug", "object": "target gene", "n_articles": "articles"})
+    st.subheader("Molecules tested or used in diseases")
+    used = filtered[filtered["relation"].isin(["tested", "treatment"])]
+    st.dataframe(used[["subject", "relation", "object", "outcome", "n_articles"]]
+                 .rename(columns={"subject": "molecule", "object": "disease", "n_articles": "articles"})
                  .sort_values("articles", ascending=False), hide_index=True, width="stretch")
-
-    with st.expander("Pipeline statistics (articles, rejected relations...)"):
-        st.json(stats)

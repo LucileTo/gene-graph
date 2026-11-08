@@ -1,12 +1,10 @@
-
-
 import argparse
 import json
 import logging
 import os
 import re
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -16,6 +14,8 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from rapidfuzz import fuzz
 from tqdm import tqdm
+
+from graph_model import ALS_ID, ALS_NAME, ALS_RELATION, MECHANISM, MECHANISMS, RELATIONS
 
 ROOT = Path(__file__).resolve().parent.parent
 ABSTRACT_FILE = ROOT / "data" / "abstract.json"
@@ -34,29 +34,36 @@ logger = logging.getLogger("associations_llm")
 # ------------------------------------------------------------------ prompt
 
 # Change the version every time you edit the prompt: it is saved with each relation.
-PROMPT_VERSION = "v1"
+PROMPT_VERSION = "v2-mechanisms"
 PROMPT = """\
-You are a biomedical curator building a knowledge graph about amyotrophic lateral sclerosis (ALS) from PubMed abstracts.
+You are a biomedical curator building a knowledge graph of mechanisms of action in neurodegenerative diseases, from PubMed abstracts.
 
-You receive the title and abstract of one article, and a list of entities already recognized in the text (genes, diseases, drugs/chemicals), each with an identifier.
+You receive the title and abstract of one article, and a list of entities you may use:
+- Disease and Molecule entities already recognized in the text, each with an identifier;
+- the 5 Mechanism entities of a CLOSED list, each with a description of what it covers.
 
 Your task: extract the relations between these entities that are explicitly stated in the text.
 
+MECHANISMS: map any mechanism described in the text to one of the 5 Mechanism entities, using their description (e.g. "mitophagy" -> autophagy, "ROS production" -> oxidative stress, "microglial activation" -> neuroinflammation). If a mechanism fits none of the 5, ignore it.
+
 ALLOWED RELATIONS (closed list, respect the direction subject -> object):
-- ASSOCIATED_WITH: Gene -> Disease. The gene (or its mutations, expression, protein) is involved in the disease.
-- TARGETS: Drug -> Gene. The drug acts on the gene, its RNA or its protein (inhibits, activates, binds, reduces, degrades...).
-- TESTED_FOR: Drug -> Disease. The drug was tested as a treatment of the disease (clinical trial, animal model, cell model). Give "outcome":
+- involved_in: Mechanism -> Disease. The mechanism takes part in the disease (its cause, progression or pathology).
+- inhibits: Molecule -> Mechanism. The molecule reduces, blocks or attenuates the mechanism (e.g. an antioxidant inhibits oxidative stress).
+- activates: Molecule -> Mechanism. The molecule enhances, restores or increases the mechanism (e.g. a drug that restores axonal transport).
+- induces: Molecule -> Mechanism. The molecule triggers or causes the mechanism (e.g. rapamycin induces autophagy, rotenone induces oxidative stress).
+- agonist_of: Molecule -> Mechanism. The molecule is described as an agonist of a receptor or pathway that belongs to the mechanism.
+- tested: Molecule -> Disease. The molecule was tested in the disease, in a pre-clinical study (cell or animal model) or a clinical trial. Give "outcome":
     "positive" = beneficial effect shown; "negative" = no benefit or harmful;
     "inconclusive" = mixed or unclear results; "ongoing" = trial planned or in progress, no result yet.
-- INTERACTS_WITH: Gene -> Gene. The two genes or their proteins interact physically or functionally.
+- treatment: Molecule -> Disease. The molecule is an established, approved or standard treatment of the disease.
 
 STRICT RULES:
 1. Use ONLY entities from the provided list. Copy their "id" exactly. Never invent an entity or an identifier.
-2. "evidence" must be ONE sentence copied word for word from the title or the abstract, the one that best supports the relation. Do not paraphrase, do not shorten, do not merge sentences.
-3. "certainty": "established" if the text states the relation as a finding or a known fact; "suggested" if it is a hypothesis, a hint, a trend or uses words like "may", "might", "could", "suggest", "potential".
-4. "negated": true if the text explicitly states that the relation does NOT exist (e.g. "no association was found", "did not improve survival"). Still report these relations. A failed drug trial is TESTED_FOR with outcome "negative" and negated false.
-5. Do not report relations that are only background knowledge not stated in this text, side effects, or adverse events.
-6. Diseases other than ALS are allowed (e.g. frontotemporal dementia).
+2. Diseases must be neurodegenerative diseases (e.g. Alzheimer disease, Parkinson disease, Huntington disease, multiple sclerosis, frontotemporal dementia). Ignore other diseases.
+3. "evidence" must be ONE sentence copied word for word from the title or the abstract, the one that best supports the relation. Do not paraphrase, do not shorten, do not merge sentences.
+4. "certainty": "established" if the text states the relation as a finding or a known fact; "suggested" if it is a hypothesis, a hint, a trend or uses words like "may", "might", "could", "suggest", "potential".
+5. "negated": true if the text explicitly states that the relation does NOT exist (e.g. "did not reduce oxidative stress"). Still report these relations. A failed trial is "tested" with outcome "negative" and negated false.
+6. Do not report relations that are only background knowledge not stated in this text, side effects, or adverse events.
 7. If there is no relation, return {"relations": []}.
 
 OUTPUT: return only a JSON object, with no text before or after, in this exact format:
@@ -64,7 +71,7 @@ OUTPUT: return only a JSON object, with no text before or after, in this exact f
   "relations": [
     {
       "subject": {"text": "<entity name>", "id": "<entity id>"},
-      "relation": "ASSOCIATED_WITH | TARGETS | TESTED_FOR | INTERACTS_WITH",
+      "relation": "involved_in | inhibits | activates | induces | agonist_of | tested | treatment",
       "object": {"text": "<entity name>", "id": "<entity id>"},
       "evidence": "<exact sentence>",
       "certainty": "established | suggested",
@@ -73,16 +80,12 @@ OUTPUT: return only a JSON object, with no text before or after, in this exact f
     }
   ]
 }
-"outcome" is null for every relation except TESTED_FOR."""
+"outcome" is null for every relation except "tested"."""
 
 
 # ------------------------------------------------------------------ expected LLM answer (pydantic)
 
-class RelationType(str, Enum):
-    ASSOCIATED_WITH = "ASSOCIATED_WITH"  # Gene -> Disease
-    TARGETS = "TARGETS"                  # Drug -> Gene
-    TESTED_FOR = "TESTED_FOR"            # Drug -> Disease (with outcome)
-    INTERACTS_WITH = "INTERACTS_WITH"    # Gene -> Gene
+RelationType = Enum("RelationType", {name.upper(): name for name in RELATIONS}, type=str)
 
 
 class Certainty(str, Enum):
@@ -95,15 +98,6 @@ class Outcome(str, Enum):
     NEGATIVE = "negative"
     INCONCLUSIVE = "inconclusive"
     ONGOING = "ongoing"
-
-
-# Allowed (subject type, object type) for each relation
-RELATION_SIGNATURES: dict[RelationType, tuple[str, str]] = {
-    RelationType.ASSOCIATED_WITH: ("Gene", "Disease"),
-    RelationType.TARGETS: ("Drug", "Gene"),
-    RelationType.TESTED_FOR: ("Drug", "Disease"),
-    RelationType.INTERACTS_WITH: ("Gene", "Gene"),
-}
 
 
 class EntityRef(BaseModel):
@@ -123,6 +117,12 @@ class ExtractedRelation(BaseModel):
     negated: bool
     outcome: Outcome | None = None
 
+    @field_validator("relation", mode="before")
+    @classmethod
+    def lowercase_relation(cls, value):
+        # Some models write "INHIBITS" or "agonist of"
+        return value.strip().lower().replace(" ", "_") if isinstance(value, str) else value
+
     @field_validator("outcome", mode="before")
     @classmethod
     def null_string_to_none(cls, value):
@@ -131,10 +131,10 @@ class ExtractedRelation(BaseModel):
 
     @model_validator(mode="after")
     def check_outcome(self):
-        if self.relation == RelationType.TESTED_FOR and self.outcome is None:
-            raise ValueError("'outcome' is required for TESTED_FOR relations")
-        if self.relation != RelationType.TESTED_FOR:
-            self.outcome = None  # only meaningful for TESTED_FOR
+        if self.relation.value == "tested" and self.outcome is None:
+            raise ValueError("'outcome' is required for 'tested' relations")
+        if self.relation.value != "tested":
+            self.outcome = None  # only meaningful for "tested"
         return self
 
 
@@ -193,19 +193,24 @@ class LLMClient:
 
 # ------------------------------------------------------------------ extraction of one article
 
+def mechanism_entities() -> list[dict]:
+    """The 5 mechanisms of the closed list, given to the LLM with every abstract."""
+    return [{"id": mid, "type": MECHANISM, "name": name, "covers": covers}
+            for mid, (name, covers) in MECHANISMS.items()]
+
+
 def build_user_message(record: dict) -> str:
     entities = [json.dumps({"id": e["id"], "type": e["type"], "name": e["name"],
                             "mentions": sorted({m["text"] for m in e["mentions"]})})
                 for e in record["entities"]]
+    entities += [json.dumps(m) for m in mechanism_entities()]
     return (f"TITLE: {record['title']}\n\nABSTRACT: {record['abstract']}\n\n"
             "ENTITIES (use only these ids):\n" + "\n".join(entities))
 
 
-def has_candidate_pair(entities: list[dict]) -> bool:
-    """False if no relation is possible (e.g. only diseases): no LLM call needed."""
-    types = Counter(e["type"] for e in entities)
-    return any(types[s] >= (2 if s == o else 1) and types[o] >= 1
-               for s, o in RELATION_SIGNATURES.values())
+def has_candidate_entity(entities: list[dict]) -> bool:
+    """Mechanisms are always available: a relation needs at least one disease or molecule."""
+    return bool(entities)
 
 
 def evidence_score(evidence: str, text: str) -> float:
@@ -222,10 +227,12 @@ def check_relation(relation, entities: dict, text: str, min_score: float):
     score = evidence_score(relation.evidence, text)
     if relation.subject.id not in entities or relation.object.id not in entities:
         return relation, "unknown_entity", score
+    if ALS_ID in (relation.subject.id, relation.object.id):
+        return relation, "als_is_added_manually", score
     if relation.subject.id == relation.object.id:
         return relation, "self_relation", score
     types = (entities[relation.subject.id]["type"], entities[relation.object.id]["type"])
-    expected = RELATION_SIGNATURES[relation.relation]
+    expected = RELATIONS[relation.relation.value]
     if types[::-1] == expected and types != expected:
         relation = relation.model_copy(update={"subject": relation.object, "object": relation.subject})
     elif types != expected:
@@ -251,7 +258,7 @@ def ask_llm(client: LLMClient, user_message: str) -> ExtractionResult:
 
 def process_article(client: LLMClient, record: dict) -> dict:
     result = ask_llm(client, build_user_message(record))
-    entities = {e["id"]: e for e in record["entities"]}
+    entities = {e["id"]: e for e in record["entities"] + mechanism_entities()}
     text = record["title"] + "\n" + record["abstract"]
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -271,6 +278,35 @@ def process_article(client: LLMClient, record: dict) -> dict:
     return {"status": "extracted", "accepted": accepted, "rejected": rejected}
 
 
+# ------------------------------------------------------------------ normalization of names
+
+def normalize_entities(records: list[dict]) -> tuple[dict, dict, dict]:
+    """One node per molecule or disease, synonyms merged.
+
+    Returns (names, types, aliases):
+    - names: id -> most frequent name in the corpus (PubTator gives the same id to synonyms);
+    - aliases: TEXT:<name> id -> id of a normalized entity with the same name, if any.
+    """
+    name_counts, types = defaultdict(Counter), {}
+    for record in records:
+        for e in record["entities"]:
+            name_counts[e["id"]][e["name"]] += 1
+            types.setdefault(e["id"], e["type"])
+    names = {i: counts.most_common(1)[0][0] for i, counts in name_counts.items()}
+
+    by_name = {}
+    for i, counts in name_counts.items():
+        if not i.startswith("TEXT:"):
+            for name in counts:
+                by_name.setdefault((types[i], name.lower()), i)
+    aliases = {i: by_name[(types[i], names[i].lower())] for i in names
+               if i.startswith("TEXT:") and (types[i], names[i].lower()) in by_name}
+
+    for mid, (name, _) in MECHANISMS.items():
+        names[mid], types[mid] = name, MECHANISM
+    return names, types, aliases
+
+
 # ------------------------------------------------------------------ merge into graph edges
 
 def summarize_outcome(outcomes: list) -> str | None:
@@ -283,13 +319,12 @@ def summarize_outcome(outcomes: list) -> str | None:
     return ranked[0][0]
 
 
-def merge_triplets(triplets: list[dict], names: dict, years: dict) -> list[dict]:
-    """One graph edge per (subject, relation, object, negated)."""
+def merge_triplets(triplets: list[dict], names: dict, aliases: dict, years: dict) -> list[dict]:
+    """One graph edge per (subject, relation, object, negated), with all its PMIDs."""
     groups = {}
     for t in triplets:
-        subject, obj = t["subject"]["id"], t["object"]["id"]
-        if t["relation"] == "INTERACTS_WITH" and subject > obj:
-            subject, obj = obj, subject  # A-B and B-A are the same interaction
+        subject = aliases.get(t["subject"]["id"], t["subject"]["id"])
+        obj = aliases.get(t["object"]["id"], t["object"]["id"])
         group = groups.setdefault((subject, t["relation"], obj, t["negated"]), {
             "subject_id": subject, "subject_type": t["subject_type"],
             "relation": t["relation"],
@@ -313,6 +348,7 @@ def merge_triplets(triplets: list[dict], names: dict, years: dict) -> list[dict]
         "relation": g["relation"],
         "object_id": g["object_id"], "object": names.get(g["object_id"], g["object_id"]),
         "object_type": g["object_type"],
+        "source": "llm",
         "negated": g["negated"],
         "n_articles": len(g["pmids"]),
         "certainty": "established" if "established" in g["certainties"] else "suggested",
@@ -327,25 +363,38 @@ def merge_triplets(triplets: list[dict], names: dict, years: dict) -> list[dict]
     } for g in groups.values()]
 
 
+def als_edges() -> list[dict]:
+    """ALS is excluded from the query: added at the very end, linked to the 5 mechanisms."""
+    return [{
+        "subject_id": mid, "subject": name, "subject_type": MECHANISM,
+        "relation": ALS_RELATION,
+        "object_id": ALS_ID, "object": ALS_NAME, "object_type": "Disease",
+        "source": "manual",
+        "negated": False, "n_articles": 0, "certainty": "established", "outcome": None,
+        "pmids": [], "evidences": [], "outcomes": [], "years": [],
+    } for mid, (name, _) in MECHANISMS.items()]
+
+
 def save(articles: list[dict], keywords: dict, results: dict) -> dict:
     pmids = [a["pmid"] for a in articles]
     records = [keywords[p] for p in pmids if p in keywords]
     done = [results[p] for p in pmids if p in results]
 
-    names, entity_types = {}, {}
-    for record in records:
-        for e in record["entities"]:
-            names.setdefault(e["id"], e["name"])
-            entity_types.setdefault(e["id"], e["type"])
-
+    names, _, aliases = normalize_entities(records)
     triplets = [t for r in done for t in r["accepted"]]
-    associations = merge_triplets(triplets, names, {a["pmid"]: a["year"] for a in articles})
+    associations = merge_triplets(triplets, names, aliases, {a["pmid"]: a["year"] for a in articles})
+    associations += als_edges()  # after the graph is built
+
     kept = [a for a in associations if not a["negated"]]
+    nodes = {}
+    for a in kept:
+        nodes[a["subject_id"]], nodes[a["object_id"]] = a["subject_type"], a["object_type"]
     stats = {
         "articles": len(articles),
         "articles_annotated_by_pubtator": len(records),
         "articles_sent_to_llm": sum(r["status"] == "extracted" for r in done),
-        "entities": dict(Counter(entity_types.values())),
+        "nodes_by_type": dict(Counter(nodes.values())),
+        "synonyms_merged": len(aliases),
         "relations_by_type": dict(Counter(a["relation"] for a in kept)),
         "negated_relations": len(associations) - len(kept),
         "rejected_by_reason": dict(Counter(x["reason"] for r in done for x in r["rejected"])),
@@ -377,7 +426,7 @@ def run(limit: int | None = None, force: bool = False) -> None:
 
     for pmid in tqdm(todo, desc="LLM", unit="article"):
         record = keywords[pmid]
-        if not has_candidate_pair(record["entities"]):
+        if not has_candidate_entity(record["entities"]):
             results[pmid] = {"status": "skipped", "accepted": [], "rejected": []}
         else:
             try:

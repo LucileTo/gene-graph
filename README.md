@@ -1,172 +1,115 @@
-# ALS Knowledge Graph (gene-graph)
+# Mechanism Knowledge Graph for ALS (gene-graph)
 
-<img src="neo4j.png" alt="Alt text" width="1200" height="800">
+A pipeline that reads scientific abstracts about **neurodegenerative diseases** (Alzheimer, Parkinson,
+Huntington…), pulls out "who is linked to whom" around **mechanisms of action**, and stores it as a
+**knowledge graph**. The goal is **drug repurposing for ALS** (amyotrophic lateral sclerosis): finding
+molecules that act on mechanisms known to matter in ALS, in articles about *other* diseases.
 
-
-
-A pipeline that reads scientific abstracts about ALS (amyotrophic lateral sclerosis, a disease of
-the nerves that control muscles), pulls out "who is linked to whom" (genes, drugs, diseases), and stores
-it as a **knowledge graph**. The long-term goal is **drug repurposing**: finding drugs that already exist for another disease and
-might also help in ALS.
+The graph is centered on 5 mechanisms, not on genes. Genes are no longer extracted.
 
 
-## What is a knowledge graph? 
+## What is a knowledge graph?
 
 A knowledge graph is a network of **things** (nodes) connected by **relationships** (arrows).
 
 ```
- [tofersen] --TARGETS--> [SOD1] --ASSOCIATED_WITH--> [ALS]
-   (drug)                 (gene)                     (disease)
+ [rapamycin] --induces--> [autophagy] --involved_in--> [Parkinson disease]
+  (molecule)              (mechanism)                     (disease)
+                               |
+                               +--documented_in_literature--> [ALS]   (added by hand)
 ```
 
-Reading it as a sentence: *"The drug tofersen targets the gene SOD1, and SOD1 is linked to ALS."*
-Once many sentences like this are stored together, we can ask questions such as **which drugs act on genes
-linked to ALS?**
+Read as sentences: *"Rapamycin induces autophagy. Autophagy is involved in Parkinson disease.
+Autophagy is documented in ALS."* Once many sentences like this are stored together, we can ask:
+**which molecules act on mechanisms documented in ALS?**
 
 
-### **Step 1: Download articles (`src/pubmed_extraction.py`)**
-- **What it does:** searches PubMed (the big database of medical papers) for ALS articles and downloads
-  their titles and abstracts.
+## The graph model
 
-- **How the PubMed searches work (no biology needed)** Think of PubMed as a giant library of medical papers. The two queries in `src/pubmed_extraction.py` are two search commands for that library.
+**Nodes (3 types)**
 
-  - **Search symbols**
-    - `AND` = both conditions must be true. `OR` = either one is enough. `NOT` = leave this out.
-    - `*` = "any ending". `gene*` matches *gene*, *genes* and *genetic*.
-    - `[MeSH]` = the official topic label that librarians put on each paper.
-    - `"Amyotrophic Lateral Sclerosis"[MeSH]` means "papers officially labeled as being about ALS".
-    - `hasabstract` = only papers that have an abstract (a short summary), because that is what we read.
+| Type | What it is | Normalization |
+|------|------------|---------------|
+| `Mechanism` | Closed list of 5: autophagy, oxidative stress, excitotoxicity, neuroinflammation, axonal transport | Any mechanism in an abstract is mapped to one of the 5 (e.g. *mitophagy* → autophagy, *ROS* → oxidative stress), otherwise ignored |
+| `Disease` | Neurodegenerative diseases cited in the abstracts | One node per PubTator identifier (MeSH), named with its most frequent name |
+| `Molecule` | Drugs and compounds cited in the abstracts | Same: one node per identifier, synonyms merged |
 
-  - **Query 1 (`QUERY`): papers about ALS**
-    > Papers labeled ALS that talk about genes, genetics, therapy, drugs or treatment, and have an abstract.
-      This is the "about ALS" shelf. It tells us which genes are linked to ALS and which drugs
-      have already been tried in ALS.
+The list of mechanisms and the relations are defined in one place: `src/graph_model.py`.
 
-  - **Query 2 (`QUERY_NON_ALS`): the same genes, but NOT in ALS papers**
-    > Papers that mention one of four ALS genes (C9orf72, SOD1, TARDBP, FUS), talk about drugs,
-    > inhibitors or therapy, and are NOT labeled ALS.
+**Edges (each one keeps the PMIDs that support it)**
 
-      This is the "same genes, other diseases" shelf. A gene that matters in ALS can also matter in
-      other diseases (for example cancer or dementia), and drugs may already exist there that act
-      on that gene. Those drugs are possible candidates for ALS. This is the idea of **drug repurposing**:
-      finding new uses for existing drugs.
+| Relation | Direction | Meaning |
+|----------|-----------|---------|
+| `involved_in` | Mechanism → Disease | the mechanism takes part in the disease |
+| `inhibits` | Molecule → Mechanism | reduces or blocks it (e.g. an antioxidant inhibits oxidative stress) |
+| `activates` | Molecule → Mechanism | enhances or restores it |
+| `induces` | Molecule → Mechanism | triggers it (e.g. rapamycin induces autophagy, rotenone induces oxidative stress) |
+| `agonist_of` | Molecule → Mechanism | agonist of a receptor or pathway of the mechanism |
+| `tested` | Molecule → Disease | pre-clinical or clinical study, with an outcome (positive, negative, inconclusive, ongoing) |
+| `treatment` | Molecule → Disease | established treatment |
+| `documented_in_literature` | Mechanism → ALS | added by hand, `source = "manual"` |
 
-  - **In short:** Query 1 answers "what do we know about ALS?". Query 2 answers "which drugs are already used on the same genes elsewhere?". The knowledge graph connects the two.
+**The ALS node.** ALS is excluded from the PubMed search on purpose, so it never appears in the
+abstracts. It is added at the very end, once the graph is built, and linked to the 5 mechanisms by a
+`documented_in_literature` edge with `source = "manual"`. Every extracted edge has `source = "llm"`,
+so the two are easy to tell apart.
 
-  - **Output:** `data/abstract.json`
 
-### **Step 2: Find the important words (`src/keyword_builder.py`)**
-  - **What it does:** sends each abstract to **PubTator**, a tool that highlights genes, diseases and drugs in
-  the text and gives each one a standard ID (like a passport number). For example, ALS is always
-  `MESH:D000690`, so "ALS" and "amyotrophic lateral sclerosis" end up as the same thing.
-  - **Extra fix:** PubTator sometimes tags "ALS" as the wrong disease. A small function (`fix_als`) corrects this.
-  - **Output:** `data/keywords.json`
+## The pipeline
 
-### **Step 3: Find the relationships (`src/associations_llm.py`)**
-  - **What it does:** gives an **LLM** (a language model) each abstract and its list of genes, drugs and
-  diseases, and asks: *"which of these are connected, and how?"*
-  - **Safety checks:** every answer is verified. The IDs must be in the list, the types must make sense
-  (a drug cannot be "associated with" another drug), and the sentence the LLM quotes as proof must really
-  exist in the abstract. Bad answers are thrown away.
-  - **Output:** `data/association.json` (each relation comes with the article number (PMID) and the proof sentence)
-
-  The four relationship types are:
-
-  | Relation | Meaning | Example |
-  |----------|---------|---------|
-  | `ASSOCIATED_WITH` | gene is linked to a disease | SOD1 -> ALS |
-  | `TARGETS` | drug acts on a gene | tofersen -> SOD1 |
-  | `TESTED_FOR` | drug was tested in a disease (with the outcome) | riluzole -> ALS (positive) |
-  | `INTERACTS_WITH` | two genes work together | gene A <-> gene B |
-
-### **Step 4: Store the graph (`neo4j/query_connection.py`)**
-  - **What it does:** loads `association.json` into **Neo4j**, a database made for graphs (nodes and arrows
-    instead of tables).
-  - **Tip:** rerunning it does not delete old data. To start fresh, run `MATCH (n) DETACH DELETE n` in Neo4j first.
-
-### **Step 5: Explore it (`app.py`)**
-  - **What it does:** a **Streamlit** web app that reads Neo4j and shows an interactive map of the graph.
-    You can filter by relation type, search a gene or drug, and click a relation to see the exact sentence
-    and the PubMed link that support it.
-
-### **Extra: Candidate ranking (`src/candidates.py`)**
-- **What it does:** looks for drugs that act on ALS-related genes but are not yet tested in ALS, and
-  ranks them.
-
-- **The main idea**
-  The question it answers: *"Which drugs act on genes linked to ALS, but are not yet recorded
-  as tested in ALS?"* Such drugs are drug-repurposing candidates.
-
-- **Candidate lists**: what counts as a drug, and what counts as already known
-  candidates.py` uses two small lists written at the top of the file. They are plain Python sets of lowercase
-  names, so they are easy to edit. They are a first version and should be **reviewed by a biologist**.
+### Step 1: Download articles (`src/pubmed_extraction.py`)
+- **What it does:** searches PubMed (the big database of medical papers) and downloads titles and abstracts.
+- **Search symbols:** `AND` = both conditions; `OR` = either one; `NOT` = leave out; `*` = any ending
+  (`autophag*` matches *autophagy*, *autophagic*…); `[MeSH]` = official topic label put on each paper;
+  `[tiab]` = the word appears in the title or abstract; `hasabstract` = only papers with an abstract.
+- **The query** has 3 parts joined by `AND`, minus ALS:
+  1. one of the **5 mechanisms** (autophagy, oxidative stress, excitotoxicity, neuroinflammation, axonal transport);
+  2. a **drug effect** (inhibitor, activator, inducer, agonist, drug therapy);
+  3. a **neurodegenerative disease**;
   
-  1. **List 1: `BLOCKLIST` (things that are not drug candidates)**
-  The LLM and PubTator sometimes label very common molecules or whole drug classes as "drugs". They appear in the
-    results only because an article says they act on a gene, but they are **not meaningful candidates**, so they are
-    removed from both candidate lists.
+  `NOT` ALS or motor neuron disease (ALS is added by hand at the end, see above).
+- **Output:** `data/abstract.json`
 
-    | Name in the list | Why it is removed |
-    |------------------|-------------------|
-    | `adenosine triphosphate`, `atp` | The energy molecule found in every cell |
-    | `rna`, `dna` | The genetic material itself, not a drug |
-    | `rna oligonucleotide`, `oligonucleotide`, `oligonucleotides`, `antisense oligonucleotide` | A class of molecules, not one specific drug |
-    | `water`, `oxygen`, `glucose` | Basic molecules of the body |
-    | `reactive oxygen species` | A by-product of cell metabolism, not a treatment |
-    | `amino acids`, `lipids`, `peptides`, `proteins` | General groups of molecules |
-    
-    &nbsp;
+### Step 2: Find the important words (`src/keyword_builder.py`)
+- **What it does:** sends each abstract to **PubTator**, which highlights diseases and chemicals in the
+  text and gives each one a standard ID (e.g. Parkinson disease is always `MESH:D010300`, whatever
+  the wording). Genes, species, cell lines are ignored. Chemicals become `Molecule` nodes.
+- Mechanisms are not tagged by PubTator: they are handled by the LLM in step 3.
+- **Output:** `data/keywords.json`
 
-  2. **List 2: `KNOWN_ALS_DRUGS` (drugs already approved or in late clinical use for ALS)**
-  These drugs are **already known in ALS**, so finding them is not a new discovery. They are kept out of the "pre-clinical" candidate list.
+### Step 3: Find the relationships (`src/associations_llm.py`)
+- **What it does:** gives an **LLM** each abstract, its diseases and molecules, and the 5 mechanisms
+  (with a description of what each one covers), and asks which of them are connected, and how.
+- **Safety checks:** every answer is verified. IDs must come from the list (so an unknown mechanism is
+  rejected), the types must fit the relation (a molecule cannot be `involved_in` a disease), and the
+  sentence the LLM quotes as proof must really be in the abstract. Bad answers are thrown away.
+- **Normalization:** synonyms are merged across the whole corpus (one node per molecule or disease).
+- **At the end:** the ALS node and its 5 `documented_in_literature` edges are added.
+- **Output:** `data/association.json` (each relation comes with its PMIDs and proof sentences)
 
-    | Name in the list | Comment |
-    |------------------|---------|
-    | `riluzole` | Long-standing ALS drug |
-    | `edaravone` | ALS drug approved in some countries |
-    | `tofersen` | Targets SOD1 (a gene linked to ALS) |
-    | `4-phenylbutyric acid`, `sodium phenylbutyrate` | Used together with taurursodiol |
-    | `ursodoxicoltaurine`, `taurursodiol`, `tauroursodeoxycholic acid` | Different names for the same partner drug |
+### Step 4: Store the graph (`neo4j/query_connection.py`)
+- **What it does:** loads `association.json` into **Neo4j**. Each node gets the label `Entity` plus its
+  type (`Mechanism`, `Disease` or `Molecule`).
+- Use `--reset` to empty the database first (otherwise new data is added to the old one).
 
-    Approval status can **differ by country** and can change over time, so this list needs to be checked and
-    updated by someone who knows the current situation.
+### Step 5: Explore it (`app.py`)
+- **What it does:** a **Streamlit** web app that reads Neo4j and shows an interactive map of the graph.
+  Filter by relation type, search a mechanism, disease or molecule, and click a relation to see the
+  exact sentence and the PubMed link that support it. Manual ALS edges are purple and dashed.
 
-- **Output:** `data/candidates.json` and a printed table. See "Candidate lists" below for how the lists are built.
+### Extra: Candidate ranking (`src/candidates.py`)
+- **The question:** *which molecules act, in the helpful direction, on mechanisms documented in ALS?*
+- **Helpful direction:** boost the protective mechanisms (`activates` / `induces` / `agonist_of`
+  autophagy or axonal transport), block the harmful ones (`inhibits` oxidative stress,
+  excitotoxicity or neuroinflammation). So a toxin that *induces* oxidative stress is not a candidate.
+- **Score:** 1 point per ALS mechanism the molecule acts on, + 0.25 per extra supporting article
+  (max +1), + 0.5 if it is already a `treatment` or `tested` with a positive outcome in another disease.
+- **Two lists at the top of the file** (plain Python sets of lowercase names, to be **reviewed by a biologist**):
+  - `BLOCKLIST`: generic molecules that are not candidates (ATP, water, glucose, ROS, glutamate…);
+  - `KNOWN_ALS_DRUGS`: drugs already used in ALS (riluzole, edaravone, tofersen…), not a discovery.
+- `--trials` counts the existing ALS trials of each candidate on ClinicalTrials.gov.
+- **Output:** `data/candidates.json` and a printed table.
 
-- **How it works, function by function**
-
-    **1. `flatten()`: split the data per article**
-    `association.json` merges several articles into one relation. This function splits it again into one
-    row per article, including the publication year. This is needed to filter by year later (time-split test).
-
-    **2. `rank_candidates()`: the core of the file**
-    1. Collect the **ALS genes**: every gene with an `ASSOCIATED_WITH` relation to ALS.
-    2. Collect the **drugs already tested in ALS** (a `TESTED_FOR` relation to ALS). These are removed,
-      because they are not new.
-    3. For every `TARGETS` relation (drug acts on a gene):
-      - If the gene is an **ALS gene**, it is a **direct** match.
-      - If the gene is not an ALS gene but **interacts with one** (`INTERACTS_WITH`), it is an **indirect** match.
-    4. Compute the score: **1 point per direct gene + 0.5 points per indirect gene**. Candidates are sorted by
-   score, then by the number of supporting articles.
-
-    Examples:
-    - `epigallocatechin gallate | direct: TARDBP` means an article says this compound acts on TARDBP,
-      and TARDBP is an ALS gene. Score 1.0.
-    - `mitoquinone | indirect: LONP1` means mitoquinone acts on LONP1, which interacts with an ALS gene.
-      Score 0.5.
-
-- **3. `main()`: the entry point**
-  It reads the command-line options, runs the ranking (or the time-split), prints a table, and saves the
-  result to `data/candidates.json`.
-
-- **4. How To Read The Result**
-  The result show two table which are "Pre clinical in ALS, not a known ALS drug" and "Target-based: acts on an ALS gene, not tested in ALS yet"
-  
-  - 1. **The heading “Pre-clinical in ALS, not a known ALS drug”** means that these drugs have been tested for ALS in the articles reviewed (with positive results for the first five, and inconclusive results for PLX5622), but they are not established or well-known ALS treatments. In short, while there are positive signals, they are still at the early, pre-clinical research stage.
-
-  - 2. **The “Target-based**” list is different: the drugs included there have not yet been tested for ALS at all. They appear only because the articles mention that these drugs act upon genes associated with ALS (such as TARDBP, C9orf72, or FUS).
-
-  <img src="candidate.png" alt="Alt text" width="800" height="400">
 
 ## How to run
 
@@ -179,21 +122,25 @@ Create a `.env` file (never commit it):
 ```
 NCBI_EMAIL=...
 NCBI_API_KEY=...        # optional
-LLM_BASE_URL=...        # OpenAI-compatible endpoint
+LLM_BASE_URL=...        # OpenAI-compatible endpoint, e.g. https://api.groq.com/openai/v1
 LLM_API_KEY=...
-LLM_MODEL=...
-NEO4J_URI=...
-NEO4J_USER=...
+LLM_MODEL=...           # must support JSON mode
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USER=neo4j
 NEO4J_PASSWORD=...
 ```
+
+From the project root:
 
 ```bash
 python src/pubmed_extraction.py --limit 20   # without --limit: up to 500 articles
 python src/keyword_builder.py
 python src/associations_llm.py
-python neo4j/query_connection.py             # run from the neo4j/ folder
-# streamlit run app.py
-python src/candidates.py                     # two candidate lists
-python src/candidates.py --min-articles 2    # only drugs supported by 2+ articles
-
+python neo4j/query_connection.py --reset     # --reset empties Neo4j first
+streamlit run app.py
+python src/candidates.py                     # ranked candidates
+python src/candidates.py --min-articles 2 --trials
 ```
+
+The scripts resume where they stopped. To start from scratch, move the old files out of `data/`
+(or use `--force` on steps 1 to 3).

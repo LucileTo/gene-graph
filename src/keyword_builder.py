@@ -15,41 +15,18 @@ KEYWORDS_FILE = ROOT / "data" / "keywords.json"
 
 API_URL = "https://www.ncbi.nlm.nih.gov/research/pubtator3-api/publications/export/biocjson"
 BATCH_SIZE = 100
-# PubTator3 type -> label in our graph (Species, CellLine... are ignored)
-ENTITY_TYPES = {"Gene": "Gene", "Disease": "Disease", "Chemical": "Drug"}
+# PubTator3 type -> label in our graph (Gene, Species, CellLine... are ignored).
+# Mechanisms are not tagged by PubTator: the LLM maps them to the closed list (graph_model.py).
+ENTITY_TYPES = {"Disease": "Disease", "Chemical": "Molecule"}
 
 logger = logging.getLogger("keyword_builder")
 
 
-def make_id(raw_id: str, pubtator_type: str, text: str) -> str:
-    """NCBIGene:6647, MESH:D000690, or TEXT:<name> when PubTator3 gives no id."""
+def make_id(raw_id: str, text: str) -> str:
+    """MESH:D010300, or TEXT:<name> when PubTator3 gives no id."""
     if raw_id in ("", "-", "None"):
         return "TEXT:" + re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
-    if pubtator_type == "Gene":
-        return f"NCBIGene:{raw_id}"
-    return raw_id  # already prefixed, e.g. MESH:D000690
-
-ALS_ID = "MESH:D000690"
-ALS_RE = re.compile(r"\bALS\b|[Aa]myotrophic [Ll]ateral [Ss]clerosis")
-
-def new_als():
-    return {"id": ALS_ID, "type": "Disease", "name": "Amyotrophic Lateral Sclerosis",
-            "normalized": True, "mentions": []}
-
-def fix_als(entities: dict, text: str) -> None:
-    """PubTator sometimes tags 'ALS' as another disease, or misses it."""
-    for eid in list(entities):
-        ent = entities[eid]
-        if eid == ALS_ID or ent["type"] != "Disease":
-            continue
-        wrong = [m for m in ent["mentions"] if m["text"] == "ALS"]
-        if wrong:
-            entities.setdefault(ALS_ID, new_als())["mentions"] += wrong
-            ent["mentions"] = [m for m in ent["mentions"] if m not in wrong]
-            if not ent["mentions"]:
-                del entities[eid]
-    if ALS_ID not in entities and ALS_RE.search(text):
-        entities[ALS_ID] = new_als()
+    return raw_id  # already prefixed, e.g. MESH:D010300
 
 
 def parse_document(doc: dict) -> dict:
@@ -64,9 +41,9 @@ def parse_document(doc: dict) -> dict:
             infons = annotation["infons"]
             if infons.get("type") not in ENTITY_TYPES:
                 continue
-            # A mention can be normalized to several ids ("6647;6648")
+            # A mention can be normalized to several ids ("MESH:D1;MESH:D2")
             for raw_id in str(infons.get("identifier") or "-").split(";"):
-                entity_id = make_id(raw_id.strip(), infons["type"], annotation["text"])
+                entity_id = make_id(raw_id.strip(), annotation["text"])
                 entity = entities.setdefault(entity_id, {
                     "id": entity_id,
                     "type": ENTITY_TYPES[infons["type"]],
@@ -78,26 +55,12 @@ def parse_document(doc: dict) -> dict:
                     entity["mentions"].append(
                         {"text": annotation["text"], "offset": loc["offset"], "length": loc["length"]})
 
-    fix_als(entities, texts["title"] + " " + texts["abstract"])
     merge_unnormalized(entities)
-
-    # Kept for a later comparison with the LLM
-    relations = []
-    for relation in doc.get("relations", []):
-        role1, role2 = relation["infons"].get("role1"), relation["infons"].get("role2")
-        if isinstance(role1, dict) and isinstance(role2, dict):
-            relations.append({
-                "type": relation["infons"].get("type"),
-                "subject_id": make_id(str(role1.get("identifier")), role1.get("type"), ""),
-                "object_id": make_id(str(role2.get("identifier")), role2.get("type"), ""),
-            })
-
-    return {"pmid": str(doc["id"]), **texts,
-            "entities": list(entities.values()), "pubtator_relations": relations}
+    return {"pmid": str(doc["id"]), **texts, "entities": list(entities.values())}
 
 
 def merge_unnormalized(entities: dict[str, dict]) -> None:
-    """E.g. TEXT:antisense_oligonucleotide_tofersen -> tofersen (MESH:C000709090)."""
+    """E.g. TEXT:the_antioxidant_edaravone -> edaravone (MESH:C...) found in the same abstract."""
     for text_id in [i for i in entities if i.startswith("TEXT:")]:
         texts = {m["text"].lower() for m in entities[text_id]["mentions"]}
         candidates = []
