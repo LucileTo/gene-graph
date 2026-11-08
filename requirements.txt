@@ -8,3 +8,4 @@ rapidfuzz
 pandas
 streamlit
 pyvis
+neo4j
