@@ -82,6 +82,6 @@ class KnowledgeGraphLoader:
 if __name__ == "__main__":
     loader = KnowledgeGraphLoader(NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD)
     try:
-        loader.import_associations("C:/Users/herur/Documents/UBE/ALS_TRANSVERSAL/ROOT/gene-graph/data/association.json")
+        loader.import_associations("/home/lucile/coding/gene-graph/data/association.json")
     finally:
         loader.close()
