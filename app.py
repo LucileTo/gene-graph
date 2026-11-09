@@ -91,7 +91,13 @@ def draw_graph(edges: pd.DataFrame, center: str | None) -> str:
                      width=2 if manual else 1 + 2 * math.sqrt(r["n_articles"]),
                      color="#7b4fd6" if manual else "#a3a29c",
                      dashes=manual or r["certainty"] == "suggested")
-    return net.generate_html()
+    html = net.generate_html()
+    # Freeze the layout once it is stable (otherwise the graph keeps moving)
+    return html.replace(
+        "network = new vis.Network(container, data, options);",
+        "network = new vis.Network(container, data, options);\n"
+        "network.once('stabilizationIterationsDone', function () {"
+        " network.setOptions({physics: false}); });")
 
 
 def show_evidence(table: pd.DataFrame, key: str) -> None:
