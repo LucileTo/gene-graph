@@ -3,6 +3,7 @@
     streamlit run app.py
 """
 
+import json
 import math
 import os
 from pathlib import Path
@@ -63,11 +64,136 @@ def neighborhood(edges: pd.DataFrame, center: str, depth: int) -> pd.DataFrame:
     return edges[edges["subject_id"].isin(reached) & edges["object_id"].isin(reached)]
 
 
+# Injected in the pyvis page: black edges on click, Ctrl+click = recenter, reset button.
+# __ALS__ is replaced by the id of the ALS node (or null).
+INTERACTION_JS = """
+(function () {
+  var ALS = __ALS__;
+  var BLACK = {color: '#000000', highlight: '#000000', hover: '#000000'};
+  var RING_GAP = 170;   // minimum distance between two rings
+  var ARC = 100;        // minimum distance between two nodes of the same ring
+
+  // Original style of every node and edge, to restore it later
+  var nodeStyle = {}, edgeStyle = {};
+  nodes.get().forEach(function (n) {
+    nodeStyle[n.id] = {id: n.id, color: n.color, size: n.size, borderWidth: n.borderWidth, font: n.font};
+  });
+  edges.get().forEach(function (e) {
+    edgeStyle[e.id] = {id: e.id, color: e.color, width: e.width, dashes: e.dashes};
+  });
+
+  function restoreStyles() {
+    nodes.update(Object.values(nodeStyle));
+    edges.update(Object.values(edgeStyle));
+  }
+
+  function highlight(id) {
+    restoreStyles();
+    var connected = network.getConnectedNodes(id);
+    edges.update(network.getConnectedEdges(id).map(function (e) {
+      return {id: e, color: BLACK, width: edgeStyle[e].width + 2};
+    }));
+    nodes.update(connected.concat([id]).map(function (n) {
+      var font = nodeStyle[n].font || {};
+      return {id: n, borderWidth: 4,
+              color: {background: nodeStyle[n].color, border: '#000000'},
+              font: {size: (font.size || 18) + 4, color: font.color || '#0b0b0b',
+                     strokeWidth: 1, strokeColor: font.color || '#0b0b0b'}};
+    }));
+  }
+
+  // ---- radial layout: the centre in the middle, then one ring per distance (1 link, 2 links...)
+  function radialLayout(centerId) {
+    var ids = nodes.getIds(), level = {}, queue = [centerId], target = {};
+    level[centerId] = 0;
+    while (queue.length) {                       // breadth-first search from the centre
+      var current = queue.shift();
+      network.getConnectedNodes(current).forEach(function (n) {
+        if (level[n] === undefined) { level[n] = level[current] + 1; queue.push(n); }
+      });
+    }
+    var maxLevel = Math.max.apply(null, Object.values(level));
+    ids.forEach(function (id) { if (level[id] === undefined) level[id] = maxLevel + 1; });  // not linked
+
+    target[centerId] = {x: 0, y: 0};
+    var angle = {}, radius = 0;
+    angle[centerId] = 0;
+    for (var k = 1; k <= Math.max.apply(null, Object.values(level)); k++) {
+      var ring = ids.filter(function (id) { return level[id] === k; });
+      if (!ring.length) continue;
+      // wanted angle = mean angle of the neighbours on the inner ring (children near their parent)
+      var wanted = {};
+      ring.forEach(function (id) {
+        var parents = network.getConnectedNodes(id).filter(function (n) { return level[n] === k - 1; });
+        var x = 0, y = 0;
+        parents.forEach(function (n) { x += Math.cos(angle[n]); y += Math.sin(angle[n]); });
+        wanted[id] = parents.length && (x || y) ? Math.atan2(y, x) : 0;
+      });
+      ring.sort(function (a, b) { return wanted[a] - wanted[b]; });
+      radius = Math.max(radius + RING_GAP, ring.length * ARC / (2 * Math.PI));
+      var offset = k === 1 ? -Math.PI / 2 : wanted[ring[0]];
+      ring.forEach(function (id, i) {
+        angle[id] = offset + 2 * Math.PI * i / ring.length;
+        target[id] = {x: radius * Math.cos(angle[id]), y: radius * Math.sin(angle[id])};
+      });
+    }
+    return target;
+  }
+
+  // Move every node to its target position, smoothly, then fit the view
+  function moveAll(target, animate) {
+    var ids = Object.keys(target), start = {};
+    ids.forEach(function (id) { start[id] = network.getPosition(id); });
+    var t0 = null, duration = animate ? 800 : 0;
+    function step(now) {
+      if (t0 === null) t0 = now;                 // same clock as requestAnimationFrame
+      var k = duration ? Math.min(1, Math.max(0, (now - t0) / duration)) : 1;
+      k = k * (2 - k);                           // ease out
+      ids.forEach(function (id) {
+        network.moveNode(id, start[id].x + (target[id].x - start[id].x) * k,
+                             start[id].y + (target[id].y - start[id].y) * k);
+      });
+      if (k < 1) requestAnimationFrame(step);
+      else network.fit({animation: animate});
+    }
+    requestAnimationFrame(step);
+  }
+
+  function centerOn(id, animate) {
+    network.setOptions({physics: false});        // the layout is computed, no simulation
+    moveAll(radialLayout(id), animate);
+  }
+
+  window.kgReset = function () {
+    restoreStyles();
+    network.unselectAll();
+    if (ALS !== null) centerOn(ALS, true); else network.fit({animation: true});
+  };
+
+  network.on('click', function (params) {
+    if (!params.nodes.length) { restoreStyles(); return; }
+    var id = params.nodes[0];
+    highlight(id);
+    if (params.event && params.event.srcEvent && params.event.srcEvent.ctrlKey) centerOn(id, true);
+  });
+
+  if (ALS !== null) centerOn(ALS, false);        // ALS in the middle from the start
+})();
+"""
+
+RESET_BUTTON = (
+    '<button onclick="kgReset()" style="position:absolute;top:8px;left:8px;z-index:10;'
+    'padding:6px 12px;border:1px solid #a3a29c;border-radius:6px;background:#fff;'
+    'cursor:pointer;font:14px sans-serif">↺ Reset graph</button>'
+)
+
+
 def draw_graph(edges: pd.DataFrame, center: str | None) -> str:
+    # No font_color here: pyvis would overwrite the per-node font (size) with it
     net = Network(height="620px", width="100%", directed=True, bgcolor="#ffffff",
-                  font_color="#0b0b0b", cdn_resources="in_line")
+                  cdn_resources="in_line")
     net.set_options("""{
-      "nodes": {"scaling": {"label": {"drawThreshold": 1}}},
+      "nodes": {"font": {"color": "#0b0b0b"}, "scaling": {"label": {"drawThreshold": 1}}},
       "edges": {"arrows": {"to": {"enabled": true, "scaleFactor": 0.5}}, "smooth": false},
       "physics": {"barnesHut": {"gravitationalConstant": -2500, "centralGravity": 0.6,
                                 "springLength": 110, "avoidOverlap": 0.5},
@@ -75,29 +201,40 @@ def draw_graph(edges: pd.DataFrame, center: str | None) -> str:
       "interaction": {"hover": true}
     }""")
     degree = pd.concat([edges["subject_id"], edges["object_id"]]).value_counts()
+    # ALS is only a landmark: the object of the manual edges, drawn big and fixed in the middle
+    manual_edges = edges[edges["source"] == "manual"]
+    als_id = manual_edges["object_id"].iloc[0] if not manual_edges.empty else None
+
     for _, r in edges.iterrows():
         for node_id, name, label in ((r["subject_id"], r["subject"], r["subject_type"]),
                                      (r["object_id"], r["object"], r["object_type"])):
-            mechanism = label == "Mechanism"
-            net.add_node(node_id, label=name, color=COLORS.get(label, "#a3a29c"),
-                         shape="box" if mechanism else "dot",
-                         size=min(8 + 3 * math.sqrt(degree.get(node_id, 1)), 32),
-                         title=f"{name} ({label}) — {degree.get(node_id, 0)} relations in view",
-                         font={"size": 26 if node_id == center or mechanism else 18})
+            options = dict(
+                label=name, color=COLORS.get(label, "#a3a29c"), borderWidth=1,
+                shape="box" if label == "Mechanism" else "dot",
+                size=min(8 + 3 * math.sqrt(degree.get(node_id, 1)), 32),
+                title=f"{name} ({label}) — {degree.get(node_id, 0)} relations in view",
+                font={"size": 26 if node_id == center or label == "Mechanism" else 18})
+            if node_id == als_id:
+                options.update(shape="circle", label="SLA", color="#d62728", margin=22,
+                               font={"size": 34, "color": "#ffffff"},
+                               title="SLA / ALS (Amyotrophic Lateral Sclerosis), added by hand")
+            net.add_node(node_id, **options)
         manual = r["source"] == "manual"
         net.add_edge(r["subject_id"], r["object_id"],
                      title=f"{r['relation']} | " + ("manual" if manual else
                                                     f"{r['n_articles']} article(s) | {r['certainty']}"),
-                     width=2 if manual else 1 + 2 * math.sqrt(r["n_articles"]),
-                     color="#7b4fd6" if manual else "#a3a29c",
-                     dashes=manual or r["certainty"] == "suggested")
+                     width=3 if manual else 1 + 2 * math.sqrt(r["n_articles"]),
+                     color="#d62728" if manual else "#a3a29c",
+                     dashes=bool(manual or r["certainty"] == "suggested"))
     html = net.generate_html()
-    # Freeze the layout once it is stable (otherwise the graph keeps moving)
-    return html.replace(
+    script = INTERACTION_JS.replace("__ALS__", json.dumps(als_id))
+    # Freeze the layout once it is stable (otherwise the graph keeps moving), then add the interactions
+    html = html.replace(
         "network = new vis.Network(container, data, options);",
         "network = new vis.Network(container, data, options);\n"
         "network.once('stabilizationIterationsDone', function () {"
-        " network.setOptions({physics: false}); });")
+        " network.setOptions({physics: false}); });\n" + script)
+    return html.replace("</body>", RESET_BUTTON + "</body>")
 
 
 def show_evidence(table: pd.DataFrame, key: str) -> None:
@@ -146,7 +283,7 @@ for side in ("subject", "object"):
 # ------------------------------------------------------------------ Explorer
 if page == "Explorer":
     st.title("Explorer")
-    st.caption("Mechanisms are boxes. ALS was added by hand at the end (purple dashed edges).")
+    st.caption("Mechanisms are boxes. ALS was added by hand at the end (red dashed edges). **Click** a node: its edges turn black. **Ctrl+click**: put it in the middle, the nodes linked to it form the first circle. **Reset graph** (top left of the graph): ALS back in the middle.")
 
     in_network = sorted(set(filtered["subject_id"]) | set(filtered["object_id"]),
                         key=lambda i: label_of[i].lower())
@@ -166,7 +303,7 @@ if page == "Explorer":
     else:
         legend = " &nbsp; ".join(f"<span style='color:{c}'>●</span> {label}" for label, c in COLORS.items())
         st.markdown(f"{legend} &nbsp;|&nbsp; edge width = number of articles &nbsp;|&nbsp; "
-                    "dashed = suggested or manual", unsafe_allow_html=True)
+                    "dashed = suggested &nbsp;|&nbsp; <span style='color:#d62728'>red dashed</span> = ALS (manual)", unsafe_allow_html=True)
         st.iframe(draw_graph(view, center), height=640)
 
     st.subheader(f"{len(view)} relations — select a row to see the evidence")
