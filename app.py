@@ -71,7 +71,7 @@ INTERACTION_JS = """
   var ALS = __ALS__;
   var BLACK = {color: '#000000', highlight: '#000000', hover: '#000000'};
   var RING_GAP = 170;   // minimum distance between two rings
-  var ARC = 100;        // minimum distance between two nodes of the same ring
+  var ARC = 125;        // minimum distance between two nodes of the same ring
 
   // Original style of every node and edge, to restore it later
   var nodeStyle = {}, edgeStyle = {};
@@ -100,6 +100,13 @@ INTERACTION_JS = """
               font: {size: (font.size || 18) + 4, color: font.color || '#0b0b0b',
                      strokeWidth: 1, strokeColor: font.color || '#0b0b0b'}};
     }));
+  }
+
+  // Always the same value between -1 and 1 for a given node id
+  function jitter(id) {
+    var h = 0;
+    String(id).split('').forEach(function (c) { h = (h * 31 + c.charCodeAt(0)) % 1000; });
+    return h / 500 - 1;
   }
 
   // ---- radial layout: the centre in the middle, then one ring per distance (1 link, 2 links...)
@@ -133,8 +140,10 @@ INTERACTION_JS = """
       radius = Math.max(radius + RING_GAP, ring.length * ARC / (2 * Math.PI));
       var offset = k === 1 ? -Math.PI / 2 : wanted[ring[0]];
       ring.forEach(function (id, i) {
-        angle[id] = offset + 2 * Math.PI * i / ring.length;
-        target[id] = {x: radius * Math.cos(angle[id]), y: radius * Math.sin(angle[id])};
+        // small fixed shift per node (not random: same result every time) so the rings look natural
+        var r = radius * (1 + (k === 1 ? 0.05 : 0.10) * jitter(id));
+        angle[id] = offset + 2 * Math.PI * (i + 0.2 * jitter(id + 'a')) / ring.length;
+        target[id] = {x: r * Math.cos(angle[id]), y: r * Math.sin(angle[id])};
       });
     }
     return target;
